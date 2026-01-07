@@ -1,0 +1,35 @@
+name: Fetch Prozorro Milk Data
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run fetch script
+        run: |
+          python src/fetch_milk_tenders.py
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v3
+        with:
+          name: prozorro-milk-data
+          path: |
+            data/outputs/*.csv
+            data/outputs/*.xlsx
+            data/logs/run_log.txt
