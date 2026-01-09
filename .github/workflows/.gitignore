@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+
+data/outputs/
+data/logs/
+
+# keep state folder, but do not store large DBs
+!data/state/
+!data/state/checkpoint.json
+data/state/*.sqlite
+data/state/*.db
