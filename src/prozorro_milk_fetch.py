@@ -19,12 +19,10 @@ import pandas as pd
 BASE_URL = os.getenv("PROZORRO_BASE_URL", "https://public-api.prozorro.gov.ua/api/2.5").rstrip("/")
 LIMIT = int(os.getenv("PROZORRO_LIMIT", "100"))
 
-# Stop early to avoid 6h hard cancel and leave time for upload/artifacts
-MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "320"))
+MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "320"))  # stop early to avoid GH 6h kill
 REQUEST_SLEEP_SECONDS = float(os.getenv("REQUEST_SLEEP_SECONDS", "0.25"))
 
-# Crucial: force detail fetch every N records even if prefilter doesn't match
-SAMPLE_EVERY = int(os.getenv("SAMPLE_EVERY", "200"))
+SAMPLE_EVERY_DEFAULT = int(os.getenv("SAMPLE_EVERY", "200"))  # <- default, do NOT modify globally
 
 EXPORT_XLSX = os.getenv("EXPORT_XLSX", "1") == "1"
 MAX_XLSX_ROWS = int(os.getenv("MAX_XLSX_ROWS", "80000"))
@@ -35,7 +33,7 @@ LOGS_DIR = DATA_DIR / "logs"
 STATE_DIR = DATA_DIR / "state"
 CHECKPOINT_PATH = STATE_DIR / "checkpoint.json"
 
-# Your requested CPV categories (DK 021:2015 / CPV)
+# Allowed CPV categories (DK 021:2015 / CPV)
 ALLOWED_CPV = [
     "15500000-3",  # Dairy products
     "15510000-6",  # Milk and cream
@@ -47,12 +45,6 @@ ALLOWED_CPV = [
     "15540000-5",  # Cheese products
     "15550000-8",  # Assorted dairy products
 ]
-
-# We fetch details only for these statuses (faster, but still covers most)
-DETAIL_STATUSES = {
-    "active.auction", "active.qualification", "active.awarded",
-    "complete", "cancelled", "unsuccessful",
-}
 
 
 # ----------------------------
@@ -131,11 +123,9 @@ def fetch_tender_detail(session: requests.Session, tender_id: str, logger: loggi
 def normalize_cpv8(cpv: Optional[str]) -> Optional[str]:
     if not cpv:
         return None
-    # expect XXXXXXXX-X; keep only digits from first 8 positions
     m = re.match(r"^(\d{8})-\d$", cpv.strip())
     if m:
         return m.group(1)
-    # sometimes stored without dash/checkdigit
     m2 = re.match(r"^(\d{8})$", cpv.strip())
     if m2:
         return m2.group(1)
@@ -143,7 +133,10 @@ def normalize_cpv8(cpv: Optional[str]) -> Optional[str]:
 
 
 def prefixes_from_allowed(allowed: List[str]) -> List[str]:
-    # Convert allowed 8-digit codes to hierarchical prefixes by trimming trailing zeros
+    """
+    Перетворюємо 8-значні CPV у “ієрархічні префікси” (обрізаємо нулі справа).
+    Це відповідає логіці CPV-дерева.
+    """
     prefixes = []
     for cpv in allowed:
         cpv8 = normalize_cpv8(cpv)
@@ -151,7 +144,6 @@ def prefixes_from_allowed(allowed: List[str]) -> List[str]:
             continue
         p = cpv8.rstrip("0")
         prefixes.append(p if p else cpv8)
-    # longer (more specific) prefixes first for clearer debugging (not required for correctness)
     return sorted(set(prefixes), key=lambda x: (-len(x), x))
 
 
@@ -206,6 +198,10 @@ def export_xlsx(csv_path: Path, xlsx_path: Path, logger: logging.Logger, max_row
 
 
 def extract_relevant_items(tender: Dict) -> List[Dict]:
+    """
+    Фільтр строго по CPV items[].classification.id:
+    зберігаємо тільки ті items, що належать до ALLOWED_CPV (через префіксне дерево).
+    """
     items = tender.get("items") or []
     rel = []
     for it in items:
@@ -248,6 +244,7 @@ def build_rows(tender: Dict, relevant_items: List[Dict]) -> Tuple[List[Dict], Li
             "auctionPeriod": tender_ap
         }]
 
+    # items можуть бути прив’язані до лота через relatedLot
     by_lot = {}
     for it in relevant_items:
         rl = it.get("relatedLot") or "single"
@@ -273,8 +270,11 @@ def build_rows(tender: Dict, relevant_items: List[Dict]) -> Tuple[List[Dict], Li
         auction_start = lot_ap.get("startDate") or tender_ap_start
         auction_end = lot_ap.get("endDate") or tender_ap_end
 
-        # which CPVs appeared in this lot
-        lot_cpvs = sorted(set([(it.get("classification") or {}).get("id") for it in rel_for_lot if (it.get("classification") or {}).get("id")]))
+        lot_cpvs = sorted(set([
+            (it.get("classification") or {}).get("id")
+            for it in rel_for_lot
+            if (it.get("classification") or {}).get("id")
+        ]))
 
         lot_rows.append({
             "tender_id": tender_id,
@@ -320,27 +320,30 @@ def main():
     rid = run_id()
     logger = setup_logger(rid)
 
+    # локальна змінна! (виправляє UnboundLocalError)
+    sample_every = SAMPLE_EVERY_DEFAULT
+
     cp = load_checkpoint()
     offset = cp.get("offset")
 
     logger.info("BASE_URL=%s", BASE_URL)
     logger.info("ALLOWED_PREFIXES=%s", ALLOWED_PREFIXES)
     logger.info("Start offset=%s", offset)
-    logger.info("LIMIT=%s | SAMPLE_EVERY=%s | MAX_RUNTIME_MINUTES=%s", LIMIT, SAMPLE_EVERY, MAX_RUNTIME_MINUTES)
+    logger.info("LIMIT=%s | SAMPLE_EVERY=%s | MAX_RUNTIME_MINUTES=%s", LIMIT, sample_every, MAX_RUNTIME_MINUTES)
 
     out_run_dir = OUTPUTS_DIR / rid
     out_run_dir.mkdir(parents=True, exist_ok=True)
 
     session = requests.Session()
-    session.headers.update({"User-Agent": "prozorro-cpv-fetch/1.1 (+github-actions)"})
+    session.headers.update({"User-Agent": "prozorro-cpv-fetch/1.2 (+github-actions)"})
 
     started = time.time()
     deadline = started + (MAX_RUNTIME_MINUTES * 60)
 
     pages = 0
     scanned_records = 0
-    forced_detail_checks = 0
     detail_checks = 0
+    forced_detail_checks = 0
     dairy_tenders = 0
     lots_written = 0
     items_written = 0
@@ -355,13 +358,17 @@ def main():
             item_rows = pack.get("items", [])
             if not lot_rows and not item_rows:
                 continue
+
             month_dir = out_run_dir / month
             lots_csv = month_dir / "dairy_lots.csv"
             items_csv = month_dir / "dairy_items.csv"
+
             write_rows_csv(lots_csv, lot_rows, logger)
             write_rows_csv(items_csv, item_rows, logger)
+
             lots_written += len(lot_rows)
             items_written += len(item_rows)
+
             buffer_by_month[month] = {"lots": [], "items": []}
 
     try:
@@ -372,7 +379,8 @@ def main():
 
             params = {
                 "limit": LIMIT,
-                "opt_fields": "id,dateModified,tenderID,title,status,procurementMethodType,classification",
+                # мінімально потрібні поля, щоб не тягти зайве
+                "opt_fields": "id,dateModified,tenderID,status",
                 "opt_pretty": "0",
             }
             if offset:
@@ -385,8 +393,6 @@ def main():
                 break
 
             pages += 1
-
-            # progress log frequently
             if pages % 200 == 0:
                 logger.info(
                     "Progress | pages=%s | scanned=%s | detail_checks=%s (forced=%s) | dairy_tenders=%s | offset=%s",
@@ -398,25 +404,16 @@ def main():
                     break
 
                 scanned_records += 1
-
-                st = rec.get("status") or ""
-                if st not in DETAIL_STATUSES:
-                    continue
-
                 tender_id = rec.get("id")
                 if not tender_id:
                     continue
 
-                # Prefilter:
-                # 1) If tender-level classification already matches allowed => fetch details
-                # 2) Otherwise, sampling => fetch details every SAMPLE_EVERY records
-                tender_cls = (rec.get("classification") or {}).get("id")
-                must_check = cpv_allowed(tender_cls)
-
-                if not must_check:
-                    if SAMPLE_EVERY > 0 and (scanned_records % SAMPLE_EVERY == 0):
-                        must_check = True
-                        forced_detail_checks += 1
+                must_check = False
+                # строгий CPV-фільтр можливий тільки по items, тому:
+                # - кожні sample_every записів форсуємо /tenders/{id} і дивимось items[].classification.id
+                if sample_every > 0 and (scanned_records % sample_every == 0):
+                    must_check = True
+                    forced_detail_checks += 1
 
                 if not must_check:
                     continue
@@ -447,7 +444,6 @@ def main():
                     buffer_by_month.setdefault(month, {"lots": [], "items": []})
                     buffer_by_month[month]["items"].append(ir)
 
-                # Flush regularly
                 if dairy_tenders % 100 == 0:
                     flush_buffers()
 
@@ -472,14 +468,15 @@ def main():
                 "lots_written_so_far": lots_written,
                 "items_written_so_far": items_written,
                 "touched_months": sorted(touched_months),
+                "sample_every": sample_every,
             }
             save_checkpoint(cp)
 
-            # If we are still not finding anything, auto-increase sampling aggressiveness
-            if pages >= 1000 and dairy_tenders == 0 and SAMPLE_EVERY > 20:
-                new_sample = max(20, SAMPLE_EVERY // 2)
-                logger.warning("No dairy found yet. Auto-tuning SAMPLE_EVERY: %s -> %s", SAMPLE_EVERY, new_sample)
-                SAMPLE_EVERY = new_sample  # dynamic adjustment
+            # якщо довго не знаходимо — робимо sampling частішим
+            if pages >= 500 and dairy_tenders == 0 and sample_every > 20:
+                new_sample = max(20, sample_every // 2)
+                logger.warning("No dairy found yet. Auto-tuning SAMPLE_EVERY: %s -> %s", sample_every, new_sample)
+                sample_every = new_sample
 
     finally:
         flush_buffers()
@@ -510,6 +507,7 @@ def main():
             "items_written": items_written,
             "touched_months": sorted(touched_months),
             "outputs_dir": str(out_run_dir),
+            "sample_every_final": sample_every,
         }
         save_checkpoint(cp)
 
