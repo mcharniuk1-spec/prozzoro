@@ -2,29 +2,37 @@ import os
 import re
 import json
 import time
+import csv
 import gzip
-import sqlite3
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Optional
 
 import requests
 import pandas as pd
 
-BASE_URL_DEFAULT = "https://public-api.prozorro.gov.ua/api/2.5"
+
+# ----------------------------
+# Config (env overridable)
+# ----------------------------
+BASE_URL = os.getenv("PROZORRO_BASE_URL", "https://public-api.prozorro.gov.ua/api/2.5").rstrip("/")
+LIMIT = int(os.getenv("PROZORRO_LIMIT", "100"))
+MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "320"))  # < 6h job cap
+REQUEST_SLEEP_SECONDS = float(os.getenv("REQUEST_SLEEP_SECONDS", "0.25"))
+
+EXPORT_XLSX = os.getenv("EXPORT_XLSX", "1") == "1"
+MAX_XLSX_ROWS = int(os.getenv("MAX_XLSX_ROWS", "80000"))
 
 DATA_DIR = Path("data")
-OUTPUT_DIR = DATA_DIR / "outputs"
-LOG_DIR = DATA_DIR / "logs"
+OUTPUTS_DIR = DATA_DIR / "outputs"
+LOGS_DIR = DATA_DIR / "logs"
 STATE_DIR = DATA_DIR / "state"
-
 CHECKPOINT_PATH = STATE_DIR / "checkpoint.json"
-DB_PATH = STATE_DIR / "prozorro_milk.sqlite"
 
-# "ДК 021:2015" CPV група 155xxxxxx-x = Dairy products
+# CPV prefix for dairy products group: 155xxxxxx-x
 CPV_PREFIXES = ("155",)
 
-# На випадок кривої/узагальненої класифікації — доганяємо ключовими словами
 KEYWORDS = [
     r"\bмолок", r"\bмолоч", r"\bвершк", r"\bсметан", r"\bкефір", r"\bйогурт",
     r"\bсир\b", r"\bтворог", r"\bмасло\b", r"\bряжен", r"\bбринз",
@@ -32,28 +40,36 @@ KEYWORDS = [
 ]
 KW_RE = re.compile("|".join(KEYWORDS), re.IGNORECASE | re.UNICODE)
 
-# Статуси, коли зазвичай вже є “нормальні” аукціонні дати/структура
-FETCH_DETAIL_STATUSES = {
+# Стани, де найчастіше вже є auctionPeriod або кінцеві дані
+DETAIL_STATUSES = {
     "active.auction", "active.qualification", "active.awarded",
     "complete", "cancelled", "unsuccessful",
 }
 
-def ensure_dirs() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def ensure_dirs():
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-def setup_logger() -> logging.Logger:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = LOG_DIR / f"run_{ts}.txt"
 
-    logger = logging.getLogger("prozorro_milk")
+def run_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def setup_logger(rid: str) -> logging.Logger:
+    logger = logging.getLogger("prozorro_milk_dairy")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
+    log_path = LOGS_DIR / f"run_{rid}.txt"
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
     fh = logging.FileHandler(log_path, encoding="utf-8")
@@ -67,26 +83,42 @@ def setup_logger() -> logging.Logger:
     logger.info("Log file: %s", log_path.as_posix())
     return logger
 
-def load_checkpoint() -> dict:
+
+def load_checkpoint() -> Dict:
     if CHECKPOINT_PATH.exists():
         return json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
     return {
         "offset": None,
-        "started_at": utc_now_iso(),
+        "created_at": utc_now_iso(),
         "last_run_at": None,
+        "last_run_id": None,
         "stats": {},
     }
 
-def save_checkpoint(cp: dict) -> None:
+
+def save_checkpoint(cp: Dict):
     CHECKPOINT_PATH.write_text(json.dumps(cp, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def request_json(session: requests.Session, url: str, params: dict, logger: logging.Logger, timeout=(10, 60), max_retries=6):
+
+def safe_get(d: Dict, path: str, default=None):
+    cur = d
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(part)
+        if cur is None:
+            return default
+    return cur
+
+
+def request_json(session: requests.Session, url: str, params: Dict, logger: logging.Logger,
+                 timeout=(10, 60), max_retries=6) -> Dict:
     backoff = 1.0
     for attempt in range(1, max_retries + 1):
         try:
             r = session.get(url, params=params, timeout=timeout)
             if r.status_code in (429, 500, 502, 503, 504):
-                logger.warning("HTTP %s on %s (attempt %s/%s) -> sleep %.1fs",
+                logger.warning("HTTP %s | %s | retry %s/%s | sleep %.1fs",
                                r.status_code, r.url, attempt, max_retries, backoff)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
@@ -94,100 +126,105 @@ def request_json(session: requests.Session, url: str, params: dict, logger: logg
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            logger.warning("Request error (attempt %s/%s): %s -> sleep %.1fs", attempt, max_retries, e, backoff)
+            logger.warning("Request error | %s | retry %s/%s | sleep %.1fs",
+                           str(e), attempt, max_retries, backoff)
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
-    raise RuntimeError(f"Failed after {max_retries} retries: {url}")
+    raise RuntimeError(f"Failed after retries: {url}")
 
-def init_db(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS tenders (
-            tender_id TEXT NOT NULL,
-            lot_id TEXT NOT NULL,
-            tenderID TEXT,
-            dateModified TEXT,
-            datePublished TEXT,
-            status TEXT,
-            procurementMethodType TEXT,
-            title TEXT,
-            procuringEntity_name TEXT,
-            classification_id TEXT,
-            classification_description TEXT,
-            value_amount REAL,
-            value_currency TEXT,
-            lot_title TEXT,
-            lot_status TEXT,
-            lot_value_amount REAL,
-            auction_startDate TEXT,
-            auction_endDate TEXT,
-            PRIMARY KEY (tender_id, lot_id)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS items (
-            tender_id TEXT NOT NULL,
-            lot_id TEXT NOT NULL,
-            item_id TEXT NOT NULL,
-            description TEXT,
-            classification_id TEXT,
-            classification_description TEXT,
-            quantity REAL,
-            unit_name TEXT,
-            PRIMARY KEY (tender_id, lot_id, item_id)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS seen (
-            tender_id TEXT PRIMARY KEY,
-            last_dateModified TEXT,
-            last_status TEXT,
-            is_candidate INTEGER,
-            last_checked_at TEXT
-        )
-    """)
-    conn.commit()
 
-def is_candidate(list_rec: dict) -> bool:
-    cls = (list_rec.get("classification") or {})
-    cls_id = (cls.get("id") or "").strip()
-    title = (list_rec.get("title") or "")
-    # інколи title/classification можуть не прийти — тоді тільки keyword
+def is_candidate_list_record(rec: Dict) -> bool:
+    title = (rec.get("title") or "").strip()
+    cls_id = (safe_get(rec, "classification.id", "") or "").strip()
     if cls_id.startswith(CPV_PREFIXES):
         return True
-    if KW_RE.search(title):
+    if title and KW_RE.search(title):
         return True
     return False
 
-def month_key(iso_dt: str) -> str:
-    # ISO 8601 -> YYYY-MM
-    if not iso_dt or len(iso_dt) < 7:
-        return "unknown"
-    return iso_dt[:7]
 
-def upsert_seen(conn: sqlite3.Connection, tender_id: str, dateModified: str, status: str, candidate: bool):
-    conn.execute("""
-        INSERT INTO seen(tender_id, last_dateModified, last_status, is_candidate, last_checked_at)
-        VALUES(?,?,?,?,?)
-        ON CONFLICT(tender_id) DO UPDATE SET
-            last_dateModified=excluded.last_dateModified,
-            last_status=excluded.last_status,
-            is_candidate=MAX(seen.is_candidate, excluded.is_candidate),
-            last_checked_at=excluded.last_checked_at
-    """, (tender_id, dateModified, status, int(candidate), utc_now_iso()))
+def dairy_category(text: str) -> str:
+    t = (text or "").lower()
+    if re.search(r"\b(молок|milk)\b", t): return "milk"
+    if re.search(r"\b(вершк|cream)\b", t): return "cream"
+    if re.search(r"\b(масло|butter)\b", t): return "butter"
+    if re.search(r"\b(йогурт|yogurt)\b", t): return "yogurt"
+    if re.search(r"\b(кефір|kefir)\b", t): return "kefir"
+    if re.search(r"\b(сметан)\b", t): return "sour_cream"
+    if re.search(r"\b(сир\b|cheese)\b", t): return "cheese"
+    if re.search(r"\b(творог)\b", t): return "curd"
+    return "dairy_other"
 
-def fetch_tender_details(session: requests.Session, base_url: str, tender_id: str, logger: logging.Logger) -> dict:
-    url = f"{base_url}/tenders/{tender_id}"
-    # opt_schema=ocds може бути корисним для OCDS-представлення, але для витягування полів tender'а не критично.
-    params = {"opt_pretty": "0"}
-    return request_json(session, url, params, logger)
 
-def extract_and_store(conn: sqlite3.Connection, tender: dict) -> set[str]:
+def period_month_key(preferred_iso: Optional[str], fallback_iso: Optional[str]) -> str:
+    dt = preferred_iso or fallback_iso or ""
+    return dt[:7] if len(dt) >= 7 else "unknown"
+
+
+def write_rows_csv(path: Path, rows: List[Dict], logger: logging.Logger):
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = path.exists()
+    fieldnames = list(rows[0].keys())
+
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+    logger.info("Appended %s rows -> %s", len(rows), path.as_posix())
+
+
+def gzip_file(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(src, "rb") as f_in, gzip.open(dst, "wb") as f_out:
+        f_out.writelines(f_in)
+
+
+def export_xlsx(csv_path: Path, xlsx_path: Path, logger: logging.Logger, max_rows: int):
+    if not csv_path.exists():
+        return
+    df = pd.read_csv(csv_path)
+    if len(df) > max_rows:
+        logger.warning("Skip XLSX (too many rows: %s) -> %s", len(df), csv_path.name)
+        return
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_excel(xlsx_path, index=False)
+    logger.info("Saved XLSX -> %s", xlsx_path.as_posix())
+
+
+# ----------------------------
+# Core extraction
+# ----------------------------
+def fetch_tender_detail(session: requests.Session, tender_id: str, logger: logging.Logger) -> Dict:
+    url = f"{BASE_URL}/tenders/{tender_id}"
+    return request_json(session, url, {"opt_pretty": "0"}, logger)
+
+
+def tender_has_dairy_items(tender: Dict) -> Tuple[bool, List[Dict]]:
     """
-    Повертає множину місяців (YYYY-MM), яких торкнулися апдейти.
+    Повертає (is_dairy, relevant_items).
+    relevant_items: список items, які виглядають як dairy.
     """
-    touched_months: set[str] = set()
+    items = tender.get("items") or []
+    relevant = []
+    for it in items:
+        descr = (it.get("description") or "").strip()
+        icls = it.get("classification") or {}
+        icls_id = (icls.get("id") or "").strip()
+        if icls_id.startswith(CPV_PREFIXES) or (descr and KW_RE.search(descr)):
+            relevant.append(it)
+    return (len(relevant) > 0, relevant)
 
-    t_id = tender.get("id") or ""
+
+def build_rows(tender: Dict, relevant_items: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    returns (lot_rows, item_rows)
+    """
+    tender_id = tender.get("id")
     tenderID = tender.get("tenderID")
     dateModified = tender.get("dateModified")
     datePublished = tender.get("datePublished")
@@ -197,260 +234,293 @@ def extract_and_store(conn: sqlite3.Connection, tender: dict) -> set[str]:
 
     pe = tender.get("procuringEntity") or {}
     pe_name = pe.get("name")
+    addr = pe.get("address") or {}
+    region = addr.get("region")
+    locality = addr.get("locality")
 
-    cls = tender.get("classification") or {}
-    cls_id = cls.get("id")
-    cls_desc = cls.get("description")
+    tcls = tender.get("classification") or {}
+    tcls_id = tcls.get("id")
+    tcls_desc = tcls.get("description")
 
     val = tender.get("value") or {}
-    val_amount = val.get("amount")
-    val_currency = val.get("currency")
-
-    # Лоти: якщо лотів нема — робимо псевдо-лот "single"
-    lots = tender.get("lots") or []
-    if not lots:
-        lots = [{
-            "id": "single",
-            "title": None,
-            "status": tender.get("status"),
-            "value": tender.get("value") or {}
-        }]
+    value_amount = val.get("amount")
+    value_currency = val.get("currency")
 
     # auctionPeriod може бути на рівні тендера або лота
     tender_ap = tender.get("auctionPeriod") or {}
     tender_ap_start = tender_ap.get("startDate")
     tender_ap_end = tender_ap.get("endDate")
 
+    lots = tender.get("lots") or []
+    if not lots:
+        lots = [{
+            "id": "single",
+            "title": None,
+            "status": status,
+            "value": val,
+            "auctionPeriod": tender_ap
+        }]
+
+    # Групуємо релевантні items по relatedLot
+    by_lot = {}
+    for it in relevant_items:
+        rl = it.get("relatedLot") or "single"
+        by_lot.setdefault(rl, []).append(it)
+
+    lot_rows = []
+    item_rows = []
+
     for lot in lots:
         lot_id = lot.get("id") or "single"
         lot_title = lot.get("title")
         lot_status = lot.get("status")
-
         lot_value = lot.get("value") or {}
         lot_value_amount = lot_value.get("amount")
 
         lot_ap = lot.get("auctionPeriod") or {}
-        ap_start = lot_ap.get("startDate") or tender_ap_start
-        ap_end = lot_ap.get("endDate") or tender_ap_end
+        auction_start = lot_ap.get("startDate") or tender_ap_start
+        auction_end = lot_ap.get("endDate") or tender_ap_end
 
-        conn.execute("""
-            INSERT INTO tenders(
-                tender_id, lot_id, tenderID, dateModified, datePublished, status, procurementMethodType,
-                title, procuringEntity_name, classification_id, classification_description,
-                value_amount, value_currency, lot_title, lot_status, lot_value_amount,
-                auction_startDate, auction_endDate
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(tender_id, lot_id) DO UPDATE SET
-                tenderID=excluded.tenderID,
-                dateModified=excluded.dateModified,
-                datePublished=excluded.datePublished,
-                status=excluded.status,
-                procurementMethodType=excluded.procurementMethodType,
-                title=excluded.title,
-                procuringEntity_name=excluded.procuringEntity_name,
-                classification_id=excluded.classification_id,
-                classification_description=excluded.classification_description,
-                value_amount=excluded.value_amount,
-                value_currency=excluded.value_currency,
-                lot_title=excluded.lot_title,
-                lot_status=excluded.lot_status,
-                lot_value_amount=excluded.lot_value_amount,
-                auction_startDate=excluded.auction_startDate,
-                auction_endDate=excluded.auction_endDate
-        """, (
-            t_id, lot_id, tenderID, dateModified, datePublished, status, pmt,
-            title, pe_name, cls_id, cls_desc,
-            val_amount, val_currency, lot_title, lot_status, lot_value_amount,
-            ap_start, ap_end
-        ))
+        rel_for_lot = by_lot.get(lot_id, [])
+        # якщо items без relatedLot — пробуємо “single”
+        if not rel_for_lot and lot_id != "single":
+            rel_for_lot = by_lot.get("single", [])
 
-        # items: прив’язка item->lot може бути через relatedLot
-        items = tender.get("items") or []
-        for it in items:
-            related_lot = it.get("relatedLot") or "single"
-            if related_lot != lot_id:
-                continue
+        if not rel_for_lot:
+            continue
 
-            item_id = it.get("id") or ""
-            descr = it.get("description")
+        cat = dairy_category(" ".join([(it.get("description") or "") for it in rel_for_lot]) + " " + (title or ""))
+
+        lot_rows.append({
+            "tender_id": tender_id,
+            "tenderID": tenderID,
+            "datePublished": datePublished,
+            "dateModified": dateModified,
+            "status": status,
+            "procurementMethodType": pmt,
+            "title": title,
+            "procuringEntity_name": pe_name,
+            "region": region,
+            "locality": locality,
+            "tender_classification_id": tcls_id,
+            "tender_classification_desc": tcls_desc,
+            "tender_value_amount": value_amount,
+            "tender_value_currency": value_currency,
+            "lot_id": lot_id,
+            "lot_title": lot_title,
+            "lot_status": lot_status,
+            "lot_value_amount": lot_value_amount,
+            "auction_startDate": auction_start,
+            "auction_endDate": auction_end,
+            "dairy_category": cat,
+        })
+
+        for it in rel_for_lot:
             icls = it.get("classification") or {}
-            icls_id = icls.get("id")
-            icls_desc = icls.get("description")
-            qty = it.get("quantity")
             unit = it.get("unit") or {}
-            unit_name = unit.get("name")
+            item_rows.append({
+                "tender_id": tender_id,
+                "lot_id": lot_id,
+                "item_id": it.get("id"),
+                "description": it.get("description"),
+                "classification_id": icls.get("id"),
+                "classification_desc": icls.get("description"),
+                "quantity": it.get("quantity"),
+                "unit_name": unit.get("name"),
+                "dairy_category": dairy_category((it.get("description") or "") + " " + (title or "")),
+            })
 
-            conn.execute("""
-                INSERT INTO items(
-                    tender_id, lot_id, item_id, description, classification_id,
-                    classification_description, quantity, unit_name
-                ) VALUES (?,?,?,?,?,?,?,?)
-                ON CONFLICT(tender_id, lot_id, item_id) DO UPDATE SET
-                    description=excluded.description,
-                    classification_id=excluded.classification_id,
-                    classification_description=excluded.classification_description,
-                    quantity=excluded.quantity,
-                    unit_name=excluded.unit_name
-            """, (t_id, lot_id, item_id, descr, icls_id, icls_desc, qty, unit_name))
+    return lot_rows, item_rows
 
-        touched_months.add(month_key(dateModified))
 
-    return touched_months
-
-def export_month(conn: sqlite3.Connection, month: str, logger: logging.Logger) -> None:
-    out_dir = OUTPUT_DIR / month
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    tenders_csv_gz = out_dir / f"tenders_{month}.csv.gz"
-    items_csv_gz = out_dir / f"items_{month}.csv.gz"
-    xlsx_path = out_dir / f"milk_dairy_{month}.xlsx"
-
-    tdf = pd.read_sql_query(
-        "SELECT * FROM tenders WHERE substr(dateModified,1,7)=? ORDER BY dateModified",
-        conn, params=(month,)
-    )
-    idf = pd.read_sql_query(
-        "SELECT i.* FROM items i JOIN tenders t ON t.tender_id=i.tender_id AND t.lot_id=i.lot_id "
-        "WHERE substr(t.dateModified,1,7)=?",
-        conn, params=(month,)
-    )
-
-    # CSV.GZ
-    with gzip.open(tenders_csv_gz, "wt", encoding="utf-8", newline="") as f:
-        tdf.to_csv(f, index=False)
-    with gzip.open(items_csv_gz, "wt", encoding="utf-8", newline="") as f:
-        idf.to_csv(f, index=False)
-
-    logger.info("Exported %s: tenders=%s rows, items=%s rows", month, len(tdf), len(idf))
-
-    # XLSX (обмежуємо розмір, щоб не вбити ран)
-    max_rows_for_xlsx = int(os.getenv("MAX_XLSX_ROWS", "200000"))
-    if len(tdf) <= max_rows_for_xlsx and len(idf) <= max_rows_for_xlsx:
-        with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-            tdf.to_excel(writer, sheet_name="tenders", index=False)
-            idf.to_excel(writer, sheet_name="items", index=False)
-        logger.info("Saved XLSX: %s", xlsx_path.as_posix())
-    else:
-        logger.warning("Skip XLSX for %s (too large). CSV.GZ is saved.", month)
-
+# ----------------------------
+# Main
+# ----------------------------
 def main():
     ensure_dirs()
-    logger = setup_logger()
-
-    base_url = os.getenv("PROZORRO_BASE_URL", BASE_URL_DEFAULT).rstrip("/")
-    limit_env = int(os.getenv("PROZORRO_LIMIT", "100"))
-    max_runtime_minutes = int(os.getenv("MAX_RUNTIME_MINUTES", "320"))  # < 6h, лишаємо час на export+artifact
-    max_runtime_seconds = max_runtime_minutes * 60
+    rid = run_id()
+    logger = setup_logger(rid)
 
     cp = load_checkpoint()
     offset = cp.get("offset")
+    logger.info("BASE_URL=%s", BASE_URL)
+    logger.info("Start offset=%s", offset)
+    logger.info("LIMIT=%s | MAX_RUNTIME_MINUTES=%s", LIMIT, MAX_RUNTIME_MINUTES)
 
-    logger.info("Base URL: %s", base_url)
-    logger.info("Start offset: %s", offset)
-    logger.info("Limit: %s", limit_env)
-    logger.info("Max runtime: %s minutes", max_runtime_minutes)
-
-    conn = sqlite3.connect(DB_PATH)
-    init_db(conn)
+    out_run_dir = OUTPUTS_DIR / rid
+    out_run_dir.mkdir(parents=True, exist_ok=True)
 
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": "prozorro-milk-fetch/1.0 (+github-actions)"
-    })
+    session.headers.update({"User-Agent": "prozorro-milk-dairy-fetch/1.0 (+github-actions)"})
 
-    start_ts = time.time()
-    touched_months: set[str] = set()
+    started = time.time()
+    deadline = started + (MAX_RUNTIME_MINUTES * 60)
 
     pages = 0
-    candidates = 0
+    list_candidates = 0
     details_fetched = 0
+    lots_written = 0
+    items_written = 0
+
+    touched_months = set()
+
+    # Буфер для періодичного flush (щоб не тримати все в RAM)
+    buffer_by_month: Dict[str, Dict[str, List[Dict]]] = {}
+
+    def flush_buffers():
+        nonlocal lots_written, items_written
+        for month, pack in list(buffer_by_month.items()):
+            lot_rows = pack.get("lots", [])
+            item_rows = pack.get("items", [])
+            if not lot_rows and not item_rows:
+                continue
+
+            month_dir = out_run_dir / month
+            lots_csv = month_dir / "milk_dairy_lots.csv"
+            items_csv = month_dir / "milk_dairy_items.csv"
+
+            write_rows_csv(lots_csv, lot_rows, logger)
+            write_rows_csv(items_csv, item_rows, logger)
+
+            lots_written += len(lot_rows)
+            items_written += len(item_rows)
+
+            buffer_by_month[month] = {"lots": [], "items": []}
 
     try:
         while True:
-            elapsed = time.time() - start_ts
-            if elapsed > max_runtime_seconds:
-                logger.warning("Time budget reached (%.1f min). Stopping gracefully...", elapsed / 60)
+            if time.time() > deadline:
+                logger.warning("Time budget reached -> stopping gracefully (so upload step can run).")
                 break
 
             params = {
-                "limit": limit_env,
-                # намагаємось забрати “легкі” поля одразу, щоб не ходити в /tenders/{id} без потреби
+                "limit": LIMIT,
                 "opt_fields": "id,dateModified,tenderID,title,status,procurementMethodType,classification",
+                "opt_pretty": "0",
             }
             if offset:
                 params["offset"] = offset
 
-            feed = request_json(session, f"{base_url}/tenders", params, logger)
+            feed = request_json(session, f"{BASE_URL}/tenders", params, logger)
             batch = feed.get("data") or []
             if not batch:
-                logger.info("No more data in feed. Done.")
+                logger.info("No data in feed -> done.")
                 break
 
             pages += 1
-            # НЕ спамимо лог кожною сторінкою (це теж час)
             if pages % 200 == 0:
-                logger.info("Progress: pages=%s, candidates=%s, details=%s, last_offset=%s",
-                            pages, candidates, details_fetched, offset)
+                logger.info("Progress | pages=%s | candidates=%s | details=%s | offset=%s",
+                            pages, list_candidates, details_fetched, offset)
 
             for rec in batch:
-                t_id = rec.get("id")
-                dm = rec.get("dateModified")
+                if time.time() > deadline:
+                    break
+
                 st = rec.get("status") or ""
-                if not t_id:
+                if not is_candidate_list_record(rec):
                     continue
 
-                cand = is_candidate(rec)
-                upsert_seen(conn, t_id, dm, st, cand)
+                list_candidates += 1
 
-                if not cand:
+                # економимо трафік/час: тягнемо деталі лише для релевантних станів
+                if st not in DETAIL_STATUSES:
                     continue
 
-                candidates += 1
-
-                # економимо час: деталі тягнемо здебільшого для “аукціонних/фінальних” станів
-                if st not in FETCH_DETAIL_STATUSES:
+                tender_id = rec.get("id")
+                if not tender_id:
                     continue
 
-                detail = fetch_tender_details(session, base_url, t_id, logger)
-                tender = (detail.get("data") or {})
-                months = extract_and_store(conn, tender)
-                touched_months |= months
+                detail = fetch_tender_detail(session, tender_id, logger)
+                tender = detail.get("data") or {}
+                ok, relevant_items = tender_has_dairy_items(tender)
+                if not ok:
+                    continue
+
+                lot_rows, item_rows = build_rows(tender, relevant_items)
+                if not lot_rows:
+                    continue
+
                 details_fetched += 1
 
-                # коміти кожні N деталей
+                # період = місяць аукціону (якщо є) інакше datePublished
+                for lr in lot_rows:
+                    month = period_month_key(lr.get("auction_startDate"), lr.get("datePublished"))
+                    touched_months.add(month)
+                    buffer_by_month.setdefault(month, {"lots": [], "items": []})
+                    buffer_by_month[month]["lots"].append(lr)
+
+                for ir in item_rows:
+                    # беремо місяць по tender_id/lot_id через lots (простий підхід)
+                    month = period_month_key(None, tender.get("datePublished"))
+                    buffer_by_month.setdefault(month, {"lots": [], "items": []})
+                    buffer_by_month[month]["items"].append(ir)
+
+                # flush кожні ~200 деталей, щоб не втратити прогрес і не роздувати RAM
                 if details_fetched % 200 == 0:
-                    conn.commit()
+                    flush_buffers()
 
-            conn.commit()
+                time.sleep(REQUEST_SLEEP_SECONDS)
 
+            # update offset
             next_page = feed.get("next_page") or {}
-            offset = next_page.get("offset")
-            if not offset:
-                logger.info("No next_page.offset found. Done.")
+            new_offset = next_page.get("offset")
+            if not new_offset:
+                logger.info("No next_page.offset -> done.")
                 break
+            offset = new_offset
+
+            # checkpoint на диск регулярно
+            cp["offset"] = offset
+            cp["last_run_at"] = utc_now_iso()
+            cp["last_run_id"] = rid
+            cp["stats"] = {
+                "pages": pages,
+                "list_candidates": list_candidates,
+                "details_fetched": details_fetched,
+                "lots_written_so_far": lots_written,
+                "items_written_so_far": items_written,
+                "touched_months": sorted(touched_months),
+            }
+            save_checkpoint(cp)
 
     finally:
-        # Зберігаємо checkpoint у будь-якому разі
+        # добиваємо flush, навіть якщо вихід ранній
+        flush_buffers()
+
+        # gzip + xlsx по місяцях цього run’а
+        for month in sorted(touched_months):
+            month_dir = out_run_dir / month
+            lots_csv = month_dir / "milk_dairy_lots.csv"
+            items_csv = month_dir / "milk_dairy_items.csv"
+
+            if lots_csv.exists():
+                gzip_file(lots_csv, month_dir / "milk_dairy_lots.csv.gz")
+            if items_csv.exists():
+                gzip_file(items_csv, month_dir / "milk_dairy_items.csv.gz")
+
+            # XLSX (обережно, щоб не вбити час/пам’ять)
+            if EXPORT_XLSX and lots_csv.exists():
+                export_xlsx(lots_csv, month_dir / "milk_dairy_lots.xlsx", logger, MAX_XLSX_ROWS)
+
+        # фінальний checkpoint
         cp["offset"] = offset
         cp["last_run_at"] = utc_now_iso()
+        cp["last_run_id"] = rid
         cp["stats"] = {
             "pages": pages,
-            "candidates": candidates,
+            "list_candidates": list_candidates,
             "details_fetched": details_fetched,
-            "touched_months_count": len(touched_months),
+            "lots_written": lots_written,
+            "items_written": items_written,
+            "touched_months": sorted(touched_months),
+            "outputs_dir": str(out_run_dir),
         }
         save_checkpoint(cp)
-        logger.info("Checkpoint saved: offset=%s", offset)
 
-        # Експортимо лише місяці, яких торкались (швидко і практично)
-        for m in sorted(touched_months):
-            export_month(conn, m, logger)
+        logger.info("DONE | pages=%s | candidates=%s | details=%s | lots=%s | items=%s",
+                    pages, list_candidates, details_fetched, lots_written, items_written)
+        logger.info("Run outputs: %s", out_run_dir.as_posix())
 
-        conn.commit()
-        conn.close()
-
-        logger.info("Done. pages=%s candidates=%s details=%s months=%s",
-                    pages, candidates, details_fetched, sorted(touched_months))
 
 if __name__ == "__main__":
     main()
