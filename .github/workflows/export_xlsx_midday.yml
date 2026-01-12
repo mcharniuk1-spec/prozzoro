@@ -1,1 +1,42 @@
+name: export-xlsx-midday
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build full XLSX
+        run: |
+          python -u src/export_current_to_xlsx.py
+
+      - name: Upload XLSX
+        uses: actions/upload-artifact@v4
+        with:
+          name: prozorro-dairy-full-xlsx
+          path: |
+            data/outputs/current/dairy_full_export.xlsx
 
