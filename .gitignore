@@ -1,0 +1,12 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# local artifacts
+data/outputs/**
+data/logs/**
+# checkpoints лишаємо в git (щоб було resume між runs)
+!data/checkpoints/**
+!data/**/.gitkeep
