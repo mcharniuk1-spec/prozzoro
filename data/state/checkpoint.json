@@ -1,13 +1,13 @@
 {
-  "offset": "1669639897.431.1.b12f684b1459e1343b2463d599691dc0",
-  "updated_at_utc": "2026-01-12T12:15:05+00:00",
+  "offset": "1669819159.097.1.2dc63bf19ad5b862ade9fbb80c4cd4fc",
+  "updated_at_utc": "2026-01-12T14:12:41+00:00",
   "stats": {
-    "pages": 309,
-    "tenders_seen": 30900,
-    "details_ok": 30879,
+    "pages": 330,
+    "tenders_seen": 33000,
+    "details_ok": 32907,
     "details_failed": 0,
     "dairy_tenders": 0,
     "dairy_items": 0,
-    "last_offset": "1669639897.431.1.b12f684b1459e1343b2463d599691dc0"
+    "last_offset": "1669819159.097.1.2dc63bf19ad5b862ade9fbb80c4cd4fc"
   }
 }
