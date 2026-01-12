@@ -1,0 +1,69 @@
+name: fetch-prozorro-dairy
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # кожні 3 години (під full-backfill). Потім можна зробити раз на 15–60 хв для "підхоплення" оновлень
+    - cron: "0 */3 * * *"
+
+concurrency:
+  group: fetch-prozorro-dairy
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run fetch
+        env:
+          BASE_URL: https://public-api.prozorro.gov.ua/api/2.5
+          LIMIT: "100"
+          MAX_RUNTIME_MINUTES: "80"
+          MAX_PAGES_PER_RUN: "2500"
+          FLUSH_EVERY_SECONDS: "60"
+          XLSX_CHUNK_EVERY_SECONDS: "120"
+          # CPV prefixes (digits)
+          ALLOWED_PREFIXES: "155,1551,15511,155111,1551121,15512,1553,1554,1555"
+        run: |
+          python src/prozorro_dairy_fetch.py
+
+      - name: Upload outputs (data folder + logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: prozorro-dairy-data
+          path: |
+            data/outputs
+            data/logs
+            data/state/checkpoint.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Commit checkpoint (small, safe)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/state/checkpoint.json || true
+          if git diff --cached --quiet; then
+            echo "No checkpoint changes."
+            exit 0
+          fi
+          git commit -m "checkpoint: update offset" || true
+          git push || true
