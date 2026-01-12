@@ -1,522 +1,443 @@
 import os
-import re
+import sys
 import json
-import time
 import csv
-import gzip
-import logging
-from pathlib import Path
+import time
+import random
+import pathlib
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-import pandas as pd
+from dateutil import parser as dtparser
 
+from openpyxl import Workbook, load_workbook
 
-# ----------------------------
-# Config (env overridable)
-# ----------------------------
 BASE_URL = os.getenv("PROZORRO_BASE_URL", "https://public-api.prozorro.gov.ua/api/2.5").rstrip("/")
 LIMIT = int(os.getenv("PROZORRO_LIMIT", "100"))
+REQUEST_SLEEP_SECONDS = float(os.getenv("REQUEST_SLEEP_SECONDS", "0.15"))
 
-MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "320"))  # stop early to avoid GH 6h kill
-REQUEST_SLEEP_SECONDS = float(os.getenv("REQUEST_SLEEP_SECONDS", "0.25"))
+MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "30"))  # важливо: коротко
+SAVE_EVERY_SECONDS = int(os.getenv("SAVE_EVERY_SECONDS", "120"))   # CSV flush
+XLSX_EVERY_SECONDS = int(os.getenv("XLSX_EVERY_SECONDS", "180"))   # XLSX update
 
-SAMPLE_EVERY_DEFAULT = int(os.getenv("SAMPLE_EVERY", "200"))  # <- default, do NOT modify globally
-
-EXPORT_XLSX = os.getenv("EXPORT_XLSX", "1") == "1"
-MAX_XLSX_ROWS = int(os.getenv("MAX_XLSX_ROWS", "80000"))
-
-DATA_DIR = Path("data")
-OUTPUTS_DIR = DATA_DIR / "outputs"
-LOGS_DIR = DATA_DIR / "logs"
-STATE_DIR = DATA_DIR / "state"
-CHECKPOINT_PATH = STATE_DIR / "checkpoint.json"
-
-# Allowed CPV categories (DK 021:2015 / CPV)
-ALLOWED_CPV = [
-    "15500000-3",  # Dairy products
-    "15510000-6",  # Milk and cream
-    "15511000-3",  # Milk
-    "15511100-4",  # Pasteurised milk
-    "15511210-8",  # UHT milk
-    "15512000-0",  # Cream
-    "15530000-2",  # Butter
-    "15540000-5",  # Cheese products
-    "15550000-8",  # Assorted dairy products
+# STRICT CPV list (ваші категорії)
+ALLOWED_CPV_CODES = [
+    "15500000",  # Dairy products
+    "15510000",  # Milk and cream
+    "15511000",  # Milk
+    "15511100",  # Pasteurised milk
+    "15511210",  # UHT milk
+    "15512000",  # Cream
+    "15530000",  # Butter
+    "15540000",  # Cheese products
+    "15550000",  # Assorted dairy products
 ]
+ALLOWED_PREFIXES = [c.rstrip("0") for c in ALLOWED_CPV_CODES]  # e.g. 1551, 15511, 1551121...
 
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT / "data"
+OUT_DIR = DATA_DIR / "outputs"
+LOG_DIR = DATA_DIR / "logs"
+CP_DIR = DATA_DIR / "checkpoints"
 
-# ----------------------------
-# Helpers
-# ----------------------------
+CURRENT_DIR = OUT_DIR / "current"
+BY_MONTH_DIR = OUT_DIR / "by_month"
+
+CHECKPOINT_PATH = CP_DIR / "checkpoint.json"
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def iso(ts: datetime) -> str:
+    return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 def ensure_dirs():
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for p in [OUT_DIR, LOG_DIR, CP_DIR, CURRENT_DIR, BY_MONTH_DIR]:
+        p.mkdir(parents=True, exist_ok=True)
 
+def open_log_file() -> pathlib.Path:
+    run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    log_path = LOG_DIR / f"run_{run_id}.txt"
+    return log_path
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+def log_line(fp, level: str, msg: str):
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts} | {level:<5} | {msg}\n"
+    fp.write(line)
+    fp.flush()
 
-
-def run_id() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-
-
-def setup_logger(rid: str) -> logging.Logger:
-    logger = logging.getLogger("prozorro_cpv_fetch")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    log_path = LOGS_DIR / f"run_{rid}.txt"
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-
-    fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-
-    logger.info("Log file: %s", log_path.as_posix())
-    return logger
-
-
-def load_checkpoint() -> Dict:
+def load_checkpoint() -> Dict[str, Any]:
     if CHECKPOINT_PATH.exists():
-        return json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
-    return {"offset": None, "created_at": utc_now_iso(), "last_run_at": None, "last_run_id": None, "stats": {}}
-
-
-def save_checkpoint(cp: Dict):
-    CHECKPOINT_PATH.write_text(json.dumps(cp, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def request_json(session: requests.Session, url: str, params: Dict, logger: logging.Logger,
-                 timeout=(10, 60), max_retries=6) -> Dict:
-    backoff = 1.0
-    for attempt in range(1, max_retries + 1):
         try:
-            r = session.get(url, params=params, timeout=timeout)
+            return json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def save_checkpoint(obj: Dict[str, Any]):
+    CHECKPOINT_PATH.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def normalize_cpv(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    return digits[:8]  # 15511210-8 -> 15511210
+
+def cpv_is_dairy(cpv8: str) -> bool:
+    if not cpv8:
+        return False
+    core = cpv8.rstrip("0")
+    # allow by prefixes derived from your list
+    return any(core.startswith(pref) for pref in ALLOWED_PREFIXES)
+
+def safe_get(session: requests.Session, url: str, params: Optional[dict] = None, max_tries: int = 6) -> Dict[str, Any]:
+    last_err = None
+    for attempt in range(1, max_tries + 1):
+        try:
+            r = session.get(url, params=params, timeout=60)
             if r.status_code in (429, 500, 502, 503, 504):
-                logger.warning("HTTP %s | retry %s/%s | sleep %.1fs | %s",
-                               r.status_code, attempt, max_retries, backoff, r.url)
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                # backoff
+                sleep_s = min(10.0, 0.5 * (2 ** (attempt - 1)) + random.random())
+                time.sleep(sleep_s)
                 continue
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            logger.warning("Request error (%s) | retry %s/%s | sleep %.1fs", str(e), attempt, max_retries, backoff)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-    raise RuntimeError(f"Failed after retries: {url}")
+            last_err = e
+            time.sleep(min(10.0, 0.5 * (2 ** (attempt - 1)) + random.random()))
+    raise RuntimeError(f"GET failed after retries: {url} | last={last_err}")
 
+def list_tenders(session: requests.Session, offset: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    url = f"{BASE_URL}/tenders"
+    params = {"limit": LIMIT}
+    if offset:
+        params["offset"] = offset
+    data = safe_get(session, url, params=params)
+    items = data.get("data", []) or []
+    next_offset = None
+    np = data.get("next_page") or {}
+    next_offset = np.get("offset")
+    return items, next_offset
 
-def fetch_tender_detail(session: requests.Session, tender_id: str, logger: logging.Logger) -> Dict:
+def fetch_tender_detail(session: requests.Session, tender_id: str) -> Dict[str, Any]:
     url = f"{BASE_URL}/tenders/{tender_id}"
-    return request_json(session, url, {"opt_pretty": "0"}, logger)
+    data = safe_get(session, url)
+    return data.get("data") or {}
 
+def month_key(dt_str: Optional[str]) -> str:
+    if not dt_str:
+        return "unknown"
+    try:
+        dt = dtparser.parse(dt_str)
+        return dt.strftime("%Y-%m")
+    except Exception:
+        return "unknown"
 
-def normalize_cpv8(cpv: Optional[str]) -> Optional[str]:
-    if not cpv:
-        return None
-    m = re.match(r"^(\d{8})-\d$", cpv.strip())
-    if m:
-        return m.group(1)
-    m2 = re.match(r"^(\d{8})$", cpv.strip())
-    if m2:
-        return m2.group(1)
-    return None
+def csv_path(kind: str, month: str) -> pathlib.Path:
+    return BY_MONTH_DIR / f"{kind}_{month}.csv"
 
-
-def prefixes_from_allowed(allowed: List[str]) -> List[str]:
-    """
-    Перетворюємо 8-значні CPV у “ієрархічні префікси” (обрізаємо нулі справа).
-    Це відповідає логіці CPV-дерева.
-    """
-    prefixes = []
-    for cpv in allowed:
-        cpv8 = normalize_cpv8(cpv)
-        if not cpv8:
-            continue
-        p = cpv8.rstrip("0")
-        prefixes.append(p if p else cpv8)
-    return sorted(set(prefixes), key=lambda x: (-len(x), x))
-
-
-ALLOWED_PREFIXES = prefixes_from_allowed(ALLOWED_CPV)
-
-
-def cpv_allowed(cpv_id: Optional[str]) -> bool:
-    cpv8 = normalize_cpv8(cpv_id)
-    if not cpv8:
-        return False
-    return any(cpv8.startswith(p) for p in ALLOWED_PREFIXES)
-
-
-def month_key(primary_iso: Optional[str], fallback_iso: Optional[str]) -> str:
-    dt = primary_iso or fallback_iso or ""
-    return dt[:7] if len(dt) >= 7 else "unknown"
-
-
-def write_rows_csv(path: Path, rows: List[Dict], logger: logging.Logger):
-    if not rows:
+def ensure_csv_header(path: pathlib.Path, fieldnames: List[str]):
+    if path.exists() and path.stat().st_size > 0:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    file_exists = path.exists()
-    fieldnames = list(rows[0].keys())
-
-    with open(path, "a", newline="", encoding="utf-8") as f:
+    with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            w.writeheader()
+        w.writeheader()
+
+class XlsxAppender:
+    def __init__(self, path: pathlib.Path):
+        self.path = path
+        self._wb = None
+
+    def _init_if_needed(self):
+        if self.path.exists():
+            self._wb = load_workbook(self.path)
+        else:
+            self._wb = Workbook()
+            # remove default sheet
+            default = self._wb.active
+            self._wb.remove(default)
+            for name, headers in [
+                ("tenders", ["tender_id","dateModified","dateCreated","status","buyer_name","buyer_id","procurementMethodType","title","value_amount","value_currency"]),
+                ("lots",    ["tender_id","lot_id","lot_title","lot_status","lot_value_amount","lot_value_currency","minimalStep_amount","minimalStep_currency"]),
+                ("items",   ["tender_id","lot_id","item_id","description","cpv","cpv_description","quantity","unit_name","unit_code","delivery_start","delivery_end","delivery_region","delivery_locality"]),
+            ]:
+                ws = self._wb.create_sheet(title=name)
+                ws.append(headers)
+            self._wb.save(self.path)
+
+    def append_rows(self, sheet: str, rows: List[List[Any]]):
+        if not rows:
+            return
+        self._init_if_needed()
+        ws = self._wb[sheet]
         for r in rows:
-            w.writerow(r)
+            ws.append(r)
 
-    logger.info("Appended %s rows -> %s", len(rows), path.as_posix())
-
-
-def gzip_file(src: Path, dst: Path):
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    with open(src, "rb") as f_in, gzip.open(dst, "wb") as f_out:
-        f_out.writelines(f_in)
-
-
-def export_xlsx(csv_path: Path, xlsx_path: Path, logger: logging.Logger, max_rows: int):
-    if not csv_path.exists():
-        return
-    df = pd.read_csv(csv_path)
-    if len(df) > max_rows:
-        logger.warning("Skip XLSX (too many rows: %s) -> %s", len(df), csv_path.name)
-        return
-    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(xlsx_path, index=False)
-    logger.info("Saved XLSX -> %s", xlsx_path.as_posix())
-
-
-def extract_relevant_items(tender: Dict) -> List[Dict]:
-    """
-    Фільтр строго по CPV items[].classification.id:
-    зберігаємо тільки ті items, що належать до ALLOWED_CPV (через префіксне дерево).
-    """
-    items = tender.get("items") or []
-    rel = []
-    for it in items:
-        cls = it.get("classification") or {}
-        if cpv_allowed(cls.get("id")):
-            rel.append(it)
-    return rel
-
-
-def build_rows(tender: Dict, relevant_items: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-    tender_id = tender.get("id")
-    tenderID = tender.get("tenderID")
-    dateModified = tender.get("dateModified")
-    datePublished = tender.get("datePublished")
-    status = tender.get("status")
-    pmt = tender.get("procurementMethodType")
-    title = tender.get("title")
-
-    pe = tender.get("procuringEntity") or {}
-    pe_name = pe.get("name")
-    addr = pe.get("address") or {}
-    region = addr.get("region")
-    locality = addr.get("locality")
-
-    val = tender.get("value") or {}
-    value_amount = val.get("amount")
-    value_currency = val.get("currency")
-
-    tender_ap = tender.get("auctionPeriod") or {}
-    tender_ap_start = tender_ap.get("startDate")
-    tender_ap_end = tender_ap.get("endDate")
-
-    lots = tender.get("lots") or []
-    if not lots:
-        lots = [{
-            "id": "single",
-            "title": None,
-            "status": status,
-            "value": val,
-            "auctionPeriod": tender_ap
-        }]
-
-    # items можуть бути прив’язані до лота через relatedLot
-    by_lot = {}
-    for it in relevant_items:
-        rl = it.get("relatedLot") or "single"
-        by_lot.setdefault(rl, []).append(it)
-
-    lot_rows = []
-    item_rows = []
-
-    for lot in lots:
-        lot_id = lot.get("id") or "single"
-        rel_for_lot = by_lot.get(lot_id, [])
-        if not rel_for_lot and lot_id != "single":
-            rel_for_lot = by_lot.get("single", [])
-        if not rel_for_lot:
-            continue
-
-        lot_title = lot.get("title")
-        lot_status = lot.get("status")
-        lot_value = lot.get("value") or {}
-        lot_value_amount = lot_value.get("amount")
-
-        lot_ap = lot.get("auctionPeriod") or {}
-        auction_start = lot_ap.get("startDate") or tender_ap_start
-        auction_end = lot_ap.get("endDate") or tender_ap_end
-
-        lot_cpvs = sorted(set([
-            (it.get("classification") or {}).get("id")
-            for it in rel_for_lot
-            if (it.get("classification") or {}).get("id")
-        ]))
-
-        lot_rows.append({
-            "tender_id": tender_id,
-            "tenderID": tenderID,
-            "datePublished": datePublished,
-            "dateModified": dateModified,
-            "status": status,
-            "procurementMethodType": pmt,
-            "title": title,
-            "procuringEntity_name": pe_name,
-            "region": region,
-            "locality": locality,
-            "tender_value_amount": value_amount,
-            "tender_value_currency": value_currency,
-            "lot_id": lot_id,
-            "lot_title": lot_title,
-            "lot_status": lot_status,
-            "lot_value_amount": lot_value_amount,
-            "auction_startDate": auction_start,
-            "auction_endDate": auction_end,
-            "cpv_ids_in_lot": "|".join(lot_cpvs),
-        })
-
-        for it in rel_for_lot:
-            cls = it.get("classification") or {}
-            unit = it.get("unit") or {}
-            item_rows.append({
-                "tender_id": tender_id,
-                "lot_id": lot_id,
-                "item_id": it.get("id"),
-                "description": it.get("description"),
-                "classification_id": cls.get("id"),
-                "classification_desc": cls.get("description"),
-                "quantity": it.get("quantity"),
-                "unit_name": unit.get("name"),
-            })
-
-    return lot_rows, item_rows
-
+    def save(self):
+        if self._wb:
+            self._wb.save(self.path)
 
 def main():
     ensure_dirs()
-    rid = run_id()
-    logger = setup_logger(rid)
-
-    # локальна змінна! (виправляє UnboundLocalError)
-    sample_every = SAMPLE_EVERY_DEFAULT
+    log_path = open_log_file()
 
     cp = load_checkpoint()
-    offset = cp.get("offset")
+    offset = cp.get("next_offset")  # server-provided offset
+    started = now_utc()
 
-    logger.info("BASE_URL=%s", BASE_URL)
-    logger.info("ALLOWED_PREFIXES=%s", ALLOWED_PREFIXES)
-    logger.info("Start offset=%s", offset)
-    logger.info("LIMIT=%s | SAMPLE_EVERY=%s | MAX_RUNTIME_MINUTES=%s", LIMIT, sample_every, MAX_RUNTIME_MINUTES)
+    xlsx_path = CURRENT_DIR / "dairy_current.xlsx"
+    xlsx = XlsxAppender(xlsx_path)
 
-    out_run_dir = OUTPUTS_DIR / rid
-    out_run_dir.mkdir(parents=True, exist_ok=True)
+    # buffers
+    tender_rows_csv: Dict[str, List[Dict[str, Any]]] = {}
+    lot_rows_csv: Dict[str, List[Dict[str, Any]]] = {}
+    item_rows_csv: Dict[str, List[Dict[str, Any]]] = {}
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": "prozorro-cpv-fetch/1.2 (+github-actions)"})
+    # xlsx rows (list-of-lists)
+    tender_rows_x: List[List[Any]] = []
+    lot_rows_x: List[List[Any]] = []
+    item_rows_x: List[List[Any]] = []
 
-    started = time.time()
-    deadline = started + (MAX_RUNTIME_MINUTES * 60)
+    last_save = time.time()
+    last_xlsx = time.time()
 
-    pages = 0
-    scanned_records = 0
-    detail_checks = 0
-    forced_detail_checks = 0
-    dairy_tenders = 0
-    lots_written = 0
-    items_written = 0
-    touched_months = set()
+    stats = {
+        "pages": 0,
+        "tenders_scanned": 0,
+        "details_fetched": 0,
+        "dairy_tenders": 0,
+        "dairy_items": 0,
+        "started_at": iso(started),
+        "base_url": BASE_URL,
+        "limit": LIMIT,
+    }
 
-    buffer_by_month: Dict[str, Dict[str, List[Dict]]] = {}
+    with log_path.open("w", encoding="utf-8") as lf, requests.Session() as session:
+        log_line(lf, "INFO", f"Log file: {log_path}")
+        log_line(lf, "INFO", f"BASE_URL={BASE_URL}")
+        log_line(lf, "INFO", f"ALLOWED_PREFIXES={ALLOWED_PREFIXES}")
+        log_line(lf, "INFO", f"Start offset={offset}")
 
-    def flush_buffers():
-        nonlocal lots_written, items_written
-        for month, pack in list(buffer_by_month.items()):
-            lot_rows = pack.get("lots", [])
-            item_rows = pack.get("items", [])
-            if not lot_rows and not item_rows:
-                continue
-
-            month_dir = out_run_dir / month
-            lots_csv = month_dir / "dairy_lots.csv"
-            items_csv = month_dir / "dairy_items.csv"
-
-            write_rows_csv(lots_csv, lot_rows, logger)
-            write_rows_csv(items_csv, item_rows, logger)
-
-            lots_written += len(lot_rows)
-            items_written += len(item_rows)
-
-            buffer_by_month[month] = {"lots": [], "items": []}
-
-    try:
         while True:
-            if time.time() > deadline:
-                logger.warning("Time budget reached -> graceful stop.")
+            elapsed = (now_utc() - started).total_seconds()
+            if elapsed >= max(60, MAX_RUNTIME_MINUTES * 60 - 60):
+                log_line(lf, "INFO", "Time budget reached, stopping gracefully...")
                 break
 
-            params = {
-                "limit": LIMIT,
-                # мінімально потрібні поля, щоб не тягти зайве
-                "opt_fields": "id,dateModified,tenderID,status",
-                "opt_pretty": "0",
-            }
-            if offset:
-                params["offset"] = offset
-
-            feed = request_json(session, f"{BASE_URL}/tenders", params, logger)
-            batch = feed.get("data") or []
-            if not batch:
-                logger.info("No data in feed -> done.")
+            items, next_offset = list_tenders(session, offset)
+            stats["pages"] += 1
+            if not items:
+                log_line(lf, "INFO", "No more tenders in list (empty page).")
+                offset = next_offset
                 break
 
-            pages += 1
-            if pages % 200 == 0:
-                logger.info(
-                    "Progress | pages=%s | scanned=%s | detail_checks=%s (forced=%s) | dairy_tenders=%s | offset=%s",
-                    pages, scanned_records, detail_checks, forced_detail_checks, dairy_tenders, offset
-                )
-
-            for rec in batch:
-                if time.time() > deadline:
-                    break
-
-                scanned_records += 1
+            for rec in items:
+                stats["tenders_scanned"] += 1
                 tender_id = rec.get("id")
                 if not tender_id:
                     continue
 
-                must_check = False
-                # строгий CPV-фільтр можливий тільки по items, тому:
-                # - кожні sample_every записів форсуємо /tenders/{id} і дивимось items[].classification.id
-                if sample_every > 0 and (scanned_records % sample_every == 0):
-                    must_check = True
-                    forced_detail_checks += 1
+                # FULL mode: fetch details for every tender to avoid missing dairy
+                detail = fetch_tender_detail(session, tender_id)
+                stats["details_fetched"] += 1
 
-                if not must_check:
+                date_modified = detail.get("dateModified")
+                date_created = detail.get("dateCreated")
+                mkey = month_key(date_modified or date_created)
+
+                title = detail.get("title") or ""
+                status = detail.get("status") or ""
+
+                buyer = (detail.get("procuringEntity") or {})
+                buyer_name = buyer.get("name") or ""
+                buyer_ident = (buyer.get("identifier") or {})
+                buyer_id = buyer_ident.get("id") or ""
+
+                pmtype = detail.get("procurementMethodType") or ""
+
+                value = (detail.get("value") or {})
+                value_amount = value.get("amount")
+                value_currency = value.get("currency")
+
+                # filter items строго по CPV
+                raw_items = detail.get("items") or []
+                dairy_items = []
+                for it in raw_items:
+                    cls = (it.get("classification") or {})
+                    cpv8 = normalize_cpv(cls.get("id"))
+                    if not cpv_is_dairy(cpv8):
+                        continue
+                    dairy_items.append(it)
+
+                if not dairy_items:
+                    # не молочний тендер -> пропускаємо
+                    offset = next_offset
                     continue
 
-                detail_checks += 1
-                detail = fetch_tender_detail(session, tender_id, logger)
-                tender = detail.get("data") or {}
+                stats["dairy_tenders"] += 1
 
-                relevant_items = extract_relevant_items(tender)
-                if not relevant_items:
-                    time.sleep(REQUEST_SLEEP_SECONDS)
-                    continue
+                tender_row = {
+                    "tender_id": tender_id,
+                    "dateModified": date_modified,
+                    "dateCreated": date_created,
+                    "status": status,
+                    "buyer_name": buyer_name,
+                    "buyer_id": buyer_id,
+                    "procurementMethodType": pmtype,
+                    "title": title,
+                    "value_amount": value_amount,
+                    "value_currency": value_currency,
+                }
+                tender_rows_csv.setdefault(mkey, []).append(tender_row)
+                tender_rows_x.append([
+                    tender_id, date_modified, date_created, status, buyer_name, buyer_id, pmtype, title, value_amount, value_currency
+                ])
 
-                dairy_tenders += 1
-                lot_rows, item_rows = build_rows(tender, relevant_items)
-                if not lot_rows:
-                    time.sleep(REQUEST_SLEEP_SECONDS)
-                    continue
+                # lots (якщо є)
+                lots = detail.get("lots") or []
+                lot_map = {l.get("id"): l for l in lots if l.get("id")}
 
-                for lr in lot_rows:
-                    month = month_key(lr.get("auction_startDate"), lr.get("datePublished"))
-                    touched_months.add(month)
-                    buffer_by_month.setdefault(month, {"lots": [], "items": []})
-                    buffer_by_month[month]["lots"].append(lr)
+                for it in dairy_items:
+                    item_id = it.get("id") or ""
+                    lot_id = it.get("relatedLot") or ""
+                    desc = it.get("description") or ""
+                    cls = (it.get("classification") or {})
+                    cpv8 = normalize_cpv(cls.get("id"))
+                    cpv_desc = cls.get("description") or ""
 
-                for ir in item_rows:
-                    month = month_key(None, tender.get("datePublished"))
-                    buffer_by_month.setdefault(month, {"lots": [], "items": []})
-                    buffer_by_month[month]["items"].append(ir)
+                    qty = it.get("quantity")
+                    unit = (it.get("unit") or {})
+                    unit_name = unit.get("name") or ""
+                    unit_code = unit.get("code") or ""
 
-                if dairy_tenders % 100 == 0:
-                    flush_buffers()
+                    ddate = (it.get("deliveryDate") or {})
+                    d_start = ddate.get("startDate")
+                    d_end = ddate.get("endDate")
 
+                    addr = (it.get("deliveryAddress") or {})
+                    region = addr.get("region") or ""
+                    locality = addr.get("locality") or ""
+
+                    item_row = {
+                        "tender_id": tender_id,
+                        "lot_id": lot_id,
+                        "item_id": item_id,
+                        "description": desc,
+                        "cpv": cpv8,
+                        "cpv_description": cpv_desc,
+                        "quantity": qty,
+                        "unit_name": unit_name,
+                        "unit_code": unit_code,
+                        "delivery_start": d_start,
+                        "delivery_end": d_end,
+                        "delivery_region": region,
+                        "delivery_locality": locality,
+                    }
+                    item_rows_csv.setdefault(mkey, []).append(item_row)
+                    item_rows_x.append([
+                        tender_id, lot_id, item_id, desc, cpv8, cpv_desc, qty, unit_name, unit_code, d_start, d_end, region, locality
+                    ])
+                    stats["dairy_items"] += 1
+
+                    if lot_id and lot_id in lot_map:
+                        l = lot_map[lot_id]
+                        lval = (l.get("value") or {})
+                        ms = (l.get("minimalStep") or {})
+                        lot_row = {
+                            "tender_id": tender_id,
+                            "lot_id": lot_id,
+                            "lot_title": l.get("title"),
+                            "lot_status": l.get("status"),
+                            "lot_value_amount": lval.get("amount"),
+                            "lot_value_currency": lval.get("currency"),
+                            "minimalStep_amount": ms.get("amount"),
+                            "minimalStep_currency": ms.get("currency"),
+                        }
+                        lot_rows_csv.setdefault(mkey, []).append(lot_row)
+                        lot_rows_x.append([
+                            tender_id, lot_id, l.get("title"), l.get("status"), lval.get("amount"), lval.get("currency"), ms.get("amount"), ms.get("currency")
+                        ])
+
+                # pacing
                 time.sleep(REQUEST_SLEEP_SECONDS)
 
-            next_page = feed.get("next_page") or {}
-            new_offset = next_page.get("offset")
-            if not new_offset:
-                logger.info("No next_page.offset -> done.")
-                break
-            offset = new_offset
+                # periodic CSV flush
+                if time.time() - last_save >= SAVE_EVERY_SECONDS:
+                    flush_csv(lf, tender_rows_csv, lot_rows_csv, item_rows_csv)
+                    tender_rows_csv.clear()
+                    lot_rows_csv.clear()
+                    item_rows_csv.clear()
+                    last_save = time.time()
 
-            cp["offset"] = offset
-            cp["last_run_at"] = utc_now_iso()
-            cp["last_run_id"] = rid
-            cp["stats"] = {
-                "pages": pages,
-                "scanned_records": scanned_records,
-                "detail_checks": detail_checks,
-                "forced_detail_checks": forced_detail_checks,
-                "dairy_tenders": dairy_tenders,
-                "lots_written_so_far": lots_written,
-                "items_written_so_far": items_written,
-                "touched_months": sorted(touched_months),
-                "sample_every": sample_every,
-            }
-            save_checkpoint(cp)
+                # periodic XLSX update
+                if time.time() - last_xlsx >= XLSX_EVERY_SECONDS:
+                    flush_xlsx(lf, xlsx, tender_rows_x, lot_rows_x, item_rows_x)
+                    tender_rows_x.clear()
+                    lot_rows_x.clear()
+                    item_rows_x.clear()
+                    last_xlsx = time.time()
 
-            # якщо довго не знаходимо — робимо sampling частішим
-            if pages >= 500 and dairy_tenders == 0 and sample_every > 20:
-                new_sample = max(20, sample_every // 2)
-                logger.warning("No dairy found yet. Auto-tuning SAMPLE_EVERY: %s -> %s", sample_every, new_sample)
-                sample_every = new_sample
+            offset = next_offset
 
-    finally:
-        flush_buffers()
+            if stats["pages"] % 50 == 0:
+                log_line(lf, "INFO",
+                         f"Progress | pages={stats['pages']} | scanned={stats['tenders_scanned']} | details={stats['details_fetched']} "
+                         f"| dairy_tenders={stats['dairy_tenders']} | dairy_items={stats['dairy_items']} | offset={offset}")
 
-        for month in sorted(touched_months):
-            month_dir = out_run_dir / month
-            lots_csv = month_dir / "dairy_lots.csv"
-            items_csv = month_dir / "dairy_items.csv"
+        # final flush
+        flush_csv(lf, tender_rows_csv, lot_rows_csv, item_rows_csv)
+        flush_xlsx(lf, xlsx, tender_rows_x, lot_rows_x, item_rows_x)
 
-            if lots_csv.exists():
-                gzip_file(lots_csv, month_dir / "dairy_lots.csv.gz")
-            if items_csv.exists():
-                gzip_file(items_csv, month_dir / "dairy_items.csv.gz")
-
-            if EXPORT_XLSX and lots_csv.exists():
-                export_xlsx(lots_csv, month_dir / "dairy_lots.xlsx", logger, MAX_XLSX_ROWS)
-
-        cp["offset"] = offset
-        cp["last_run_at"] = utc_now_iso()
-        cp["last_run_id"] = rid
-        cp["stats"] = {
-            "pages": pages,
-            "scanned_records": scanned_records,
-            "detail_checks": detail_checks,
-            "forced_detail_checks": forced_detail_checks,
-            "dairy_tenders": dairy_tenders,
-            "lots_written": lots_written,
-            "items_written": items_written,
-            "touched_months": sorted(touched_months),
-            "outputs_dir": str(out_run_dir),
-            "sample_every_final": sample_every,
+        cp_out = {
+            "next_offset": offset,
+            "updated_at": iso(now_utc()),
+            "stats": stats,
         }
-        save_checkpoint(cp)
+        save_checkpoint(cp_out)
+        log_line(lf, "INFO", f"Saved checkpoint: {CHECKPOINT_PATH}")
+        log_line(lf, "INFO", f"Saved XLSX current: {xlsx_path}")
+        log_line(lf, "INFO", f"Done. stats={json.dumps(stats, ensure_ascii=False)}")
 
-        logger.info(
-            "DONE | pages=%s | scanned=%s | detail_checks=%s (forced=%s) | dairy_tenders=%s | lots=%s | items=%s",
-            pages, scanned_records, detail_checks, forced_detail_checks, dairy_tenders, lots_written, items_written
-        )
-        logger.info("Run outputs: %s", out_run_dir.as_posix())
+def flush_csv(lf, tender_rows_csv, lot_rows_csv, item_rows_csv):
+    # tenders
+    tender_fields = ["tender_id","dateModified","dateCreated","status","buyer_name","buyer_id","procurementMethodType","title","value_amount","value_currency"]
+    lot_fields = ["tender_id","lot_id","lot_title","lot_status","lot_value_amount","lot_value_currency","minimalStep_amount","minimalStep_currency"]
+    item_fields = ["tender_id","lot_id","item_id","description","cpv","cpv_description","quantity","unit_name","unit_code","delivery_start","delivery_end","delivery_region","delivery_locality"]
 
+    for m, rows in tender_rows_csv.items():
+        p = csv_path("tenders", m)
+        ensure_csv_header(p, tender_fields)
+        with p.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=tender_fields)
+            w.writerows(rows)
+
+    for m, rows in lot_rows_csv.items():
+        p = csv_path("lots", m)
+        ensure_csv_header(p, lot_fields)
+        with p.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=lot_fields)
+            w.writerows(rows)
+
+    for m, rows in item_rows_csv.items():
+        p = csv_path("items", m)
+        ensure_csv_header(p, item_fields)
+        with p.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=item_fields)
+            w.writerows(rows)
+
+    log_line(lf, "INFO", f"CSV flush: tenders_months={len(tender_rows_csv)} lots_months={len(lot_rows_csv)} items_months={len(item_rows_csv)}")
+
+def flush_xlsx(lf, xlsx: XlsxAppender, tender_rows_x, lot_rows_x, item_rows_x):
+    xlsx.append_rows("tenders", tender_rows_x)
+    xlsx.append_rows("lots", lot_rows_x)
+    xlsx.append_rows("items", item_rows_x)
+    xlsx.save()
+    log_line(lf, "INFO", f"XLSX update: tenders+{len(tender_rows_x)} lots+{len(lot_rows_x)} items+{len(item_rows_x)}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Interrupted", file=sys.stderr)
+        sys.exit(130)
