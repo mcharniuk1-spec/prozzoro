@@ -1,4 +1,4 @@
-name: fetch-prozorro-milk-dairy
+name: Main
 
 on:
   workflow_dispatch:
