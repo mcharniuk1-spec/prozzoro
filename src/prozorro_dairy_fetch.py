@@ -1,197 +1,105 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+from __future__ import annotations
 
 import csv
 import json
 import logging
 import os
 import re
-import signal
 import sys
 import time
-from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-try:
-    from openpyxl import Workbook
-except Exception:
-    Workbook = None  # XLSX chunks optional if dependency missing
 
 
-# -------------------------
-# Config (env-overridable)
-# -------------------------
-BASE_URL = os.getenv("BASE_URL", "https://public-api.prozorro.gov.ua/api/2.5").rstrip("/")
-LIMIT = int(os.getenv("LIMIT", "100"))  # API feed batch size
-DETAIL_WORKERS = int(os.getenv("DETAIL_WORKERS", "1"))  # keep 1 by default (safer), can raise to 4-8
-MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "70"))
-MAX_PAGES_PER_RUN = int(os.getenv("MAX_PAGES_PER_RUN", "2000"))
+# -----------------------------
+# Config
+# -----------------------------
+BASE_URL = os.getenv("PROZORRO_BASE_URL", "https://public-api.prozorro.gov.ua/api/2.5").rstrip("/")
 
-FLUSH_EVERY_SECONDS = int(os.getenv("FLUSH_EVERY_SECONDS", "60"))      # CSV flush frequency
-XLSX_CHUNK_EVERY_SECONDS = int(os.getenv("XLSX_CHUNK_EVERY_SECONDS", "120"))  # Excel chunk frequency (1–3 min)
+# Your requested CPV set (UA/EN don't matter here; we match numeric code)
+DEFAULT_CPV_CODES = [
+    "15500000-3",  # Dairy products
+    "15510000-6",  # Milk and cream
+    "15511000-3",  # Milk
+    "15511100-4",  # Pasteurised milk
+    "15511210-8",  # UHT milk
+    "15512000-0",  # Cream
+    "15530000-2",  # Butter
+    "15540000-5",  # Cheese products
+    "15550000-8",  # Assorted dairy products
+]
 
-# CPV prefixes (digits-only)
-DEFAULT_ALLOWED_PREFIXES = "155,1551,15511,155111,1551121,15512,1553,1554,1555"
-ALLOWED_PREFIXES = tuple(
-    p.strip() for p in os.getenv("ALLOWED_PREFIXES", DEFAULT_ALLOWED_PREFIXES).split(",") if p.strip()
-)
+# You can override via env: CPV_CODES="15500000-3,15511100-4,..."
+CPV_CODES = [c.strip() for c in os.getenv("CPV_CODES", ",".join(DEFAULT_CPV_CODES)).split(",") if c.strip()]
+
+# Feed paging
+LIMIT = int(os.getenv("LIMIT", "100"))  # feed batch size (docs: default 100) :contentReference[oaicite:7]{index=7}
+DETAIL_WORKERS = int(os.getenv("DETAIL_WORKERS", "10"))
+
+# Time-budget: stop BEFORE GH kills job; leave room for upload/commit steps
+MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "320"))
+
+# Flush checkpoint + log progress often
+SAVE_EVERY_SECONDS = int(os.getenv("SAVE_EVERY_SECONDS", "120"))
+
+# Backfill start
+START_DATE = os.getenv("START_DATE", "2024-01-01")  # ISO date
+START_OFFSET = os.getenv("START_OFFSET", "").strip()  # if you already have offset, set it here
 
 # Paths
-DATA_DIR = Path("data")
-STATE_DIR = DATA_DIR / "state"
-OUTPUTS_DIR = DATA_DIR / "outputs"
-CURRENT_DIR = OUTPUTS_DIR / "current"
-RUNS_DIR = OUTPUTS_DIR / "runs"
-LOGS_DIR = DATA_DIR / "logs"
-CHECKPOINT_PATH = STATE_DIR / "checkpoint.json"
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "data/outputs"))
+MONTHLY_DIR = OUTPUT_DIR / "monthly"
+LOG_DIR = Path(os.getenv("LOG_DIR", "data/logs"))
+STATE_DIR = Path(os.getenv("STATE_DIR", "data/state"))
 
-# Output files (cumulative)
-ITEMS_CSV = CURRENT_DIR / "dairy_items.csv"
-TENDERS_CSV = CURRENT_DIR / "dairy_tenders.csv"
-# XLSX chunks dir (small files every 1–3 minutes)
-XLSX_CHUNKS_DIR = CURRENT_DIR / "xlsx_chunks"
+CHECKPOINT_PATH = STATE_DIR / "prozorro_checkpoint.json"
 
-# Fields
-ITEM_FIELDS = [
-    "run_ts_utc",
-    "tender_id",
-    "tenderID",
-    "tender_status",
-    "tender_datePublished",
-    "tender_dateModified",
-    "procuringEntity_name",
-    "procuringEntity_edrpou",
-    "auction_startDate",
-    "auction_endDate",
-    "item_id",
-    "item_description",
-    "cpv",
-    "cpv_digits",
-    "quantity",
-    "unit_name",
-    "unit_code",
-    "unit_value_amount",
-    "unit_value_currency",
-    "delivery_endDate",
-    "delivery_streetAddress",
-    "delivery_locality",
-    "delivery_region",
-    "delivery_postalCode",
-    "delivery_countryName",
-]
+RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_utc")
+LOG_PATH = LOG_DIR / f"run_{RUN_ID}.txt"
 
-TENDER_FIELDS = [
-    "run_ts_utc",
-    "tender_id",
-    "tenderID",
-    "tender_status",
-    "tender_datePublished",
-    "tender_dateModified",
-    "title",
-    "procuringEntity_name",
-    "procuringEntity_edrpou",
-    "value_amount",
-    "value_currency",
-    "auction_startDate",
-    "auction_endDate",
-]
+ALL_CSV_PATH = OUTPUT_DIR / "prozorro_dairy_items_all.csv"
 
 
-STOP_REQUESTED = False
-
-
-def _sig_handler(signum, frame):
-    global STOP_REQUESTED
-    STOP_REQUESTED = True
-
-
-signal.signal(signal.SIGTERM, _sig_handler)
-signal.signal(signal.SIGINT, _sig_handler)
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def ensure_dirs() -> None:
-    for p in [DATA_DIR, STATE_DIR, OUTPUTS_DIR, CURRENT_DIR, RUNS_DIR, LOGS_DIR, XLSX_CHUNKS_DIR]:
+# -----------------------------
+# Helpers
+# -----------------------------
+def mkdirs() -> None:
+    for p in [OUTPUT_DIR, MONTHLY_DIR, LOG_DIR, STATE_DIR]:
         p.mkdir(parents=True, exist_ok=True)
 
 
 def setup_logger() -> logging.Logger:
-    ensure_dirs()
-    run_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    log_file = LOGS_DIR / f"run_{run_stamp}.txt"
-
     logger = logging.getLogger("prozorro_dairy_fetch")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
     fh.setFormatter(fmt)
+    fh.setLevel(logging.INFO)
+
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
+    sh.setLevel(logging.INFO)
 
     logger.addHandler(fh)
     logger.addHandler(sh)
-
-    logger.info("Log file: %s", log_file.as_posix())
-    logger.info("BASE_URL=%s", BASE_URL)
-    logger.info("ALLOWED_PREFIXES=%s", list(ALLOWED_PREFIXES))
-    logger.info("LIMIT=%s | MAX_RUNTIME_MINUTES=%s | MAX_PAGES_PER_RUN=%s", LIMIT, MAX_RUNTIME_MINUTES, MAX_PAGES_PER_RUN)
-    logger.info("FLUSH_EVERY_SECONDS=%s | XLSX_CHUNK_EVERY_SECONDS=%s", FLUSH_EVERY_SECONDS, XLSX_CHUNK_EVERY_SECONDS)
-
     return logger
 
 
-def build_session() -> requests.Session:
-    s = requests.Session()
-    retries = Retry(
-        total=8,
-        backoff_factor=0.8,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET",),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
-    s.mount("https://", adapter)
-    s.headers.update(
-        {
-            "User-Agent": "prozorro-dairy-fetch/1.0 (+github-actions)",
-            "Accept": "application/json",
-        }
-    )
-    return s
+def atomic_write_json(path: Path, obj: Dict[str, Any]) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
-def digits_only_cpv(cpv: str) -> str:
-    # "15511000-3" -> "15511000"
-    if not cpv:
-        return ""
-    m = re.findall(r"\d+", cpv)
-    if not m:
-        return ""
-    joined = "".join(m)
-    return joined[:8] if len(joined) >= 8 else joined
-
-
-def matches_allowed_cpv(cpv_digits: str) -> bool:
-    if not cpv_digits:
-        return False
-    # prefix match on digits (not necessarily 8)
-    return any(cpv_digits.startswith(pref) for pref in ALLOWED_PREFIXES)
-
-
-def read_checkpoint() -> Dict[str, Any]:
+def load_checkpoint() -> Dict[str, Any]:
     if CHECKPOINT_PATH.exists():
         try:
             return json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
@@ -200,334 +108,459 @@ def read_checkpoint() -> Dict[str, Any]:
     return {}
 
 
-def write_checkpoint(offset: Optional[str], stats: Dict[str, Any]) -> None:
-    payload = {
-        "offset": offset,
-        "updated_at_utc": utc_now_iso(),
-        "stats": stats,
-    }
-    CHECKPOINT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+def iso_to_month_key(iso_dt: str) -> str:
+    # iso like "2026-01-09T14:12:39.175+02:00"
+    # month key "2026_01"
+    try:
+        dt = datetime.fromisoformat(iso_dt.replace("Z", "+00:00"))
+        return f"{dt.year:04d}_{dt.month:02d}"
+    except Exception:
+        return "unknown"
 
 
-def append_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    with path.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        if not exists:
-            w.writeheader()
+def digits_only(code: str) -> str:
+    return "".join(ch for ch in code if ch.isdigit())
+
+
+def cpv_prefixes(codes: List[str]) -> List[str]:
+    """
+    Convert CPV codes into numeric prefixes that include subcodes.
+    Example:
+      15500000-3 -> digits "155000003" -> base "15500000" -> strip trailing zeros -> "155"
+      15511100-4 -> base "15511100" -> strip trailing zeros -> "155111"
+    """
+    prefixes: List[str] = []
+    for c in codes:
+        d = digits_only(c)
+        base = d[:8] if len(d) >= 8 else d
+        base = base.rstrip("0") or base
+        prefixes.append(base)
+    # de-duplicate longest-first (more specific first)
+    prefixes = sorted(set(prefixes), key=lambda x: (-len(x), x))
+    return prefixes
+
+
+ALLOWED_PREFIXES = cpv_prefixes(CPV_CODES)
+
+# Output schema (flat, stable)
+FIELDNAMES = [
+    # tender meta
+    "tender_id",
+    "tenderID",
+    "dateModified",
+    "status",
+    "title",
+    "procurementMethodType",
+    "procuringEntity_name",
+    "procuringEntity_edrpou",
+    # key dates
+    "tenderPeriod_startDate",
+    "tenderPeriod_endDate",
+    "auctionPeriod_startDate",
+    # tender value (if present)
+    "tender_value_amount",
+    "tender_value_currency",
+    # item (one row per matched item)
+    "item_id",
+    "item_description",
+    "cpv_id",
+    "cpv_description",
+    "item_quantity",
+    "item_unit",
+    "delivery_endDate",
+    "delivery_region",
+    "delivery_locality",
+    # award (best-effort)
+    "award_status",
+    "award_date",
+    "award_value_amount",
+    "award_value_currency",
+    "supplier_name",
+    "supplier_id",
+    # partitioning
+    "period_key",
+]
+
+
+@dataclass
+class Stats:
+    pages: int = 0
+    tenders_in_feed: int = 0
+    tenders_details_ok: int = 0
+    tenders_details_fail: int = 0
+    matched_rows: int = 0
+    last_offset: str = ""
+
+
+class CsvPartitionWriter:
+    def __init__(self, all_path: Path, monthly_dir: Path, fieldnames: List[str]) -> None:
+        self.all_path = all_path
+        self.monthly_dir = monthly_dir
+        self.fieldnames = fieldnames
+        self._all_fh = None
+        self._all_writer = None
+        self._month_fhs: Dict[str, Any] = {}
+        self._month_writers: Dict[str, csv.DictWriter] = {}
+
+    def _open_writer(self, path: Path) -> csv.DictWriter:
+        is_new = (not path.exists()) or (path.stat().st_size == 0)
+        fh = open(path, "a", newline="", encoding="utf-8")
+        writer = csv.DictWriter(fh, fieldnames=self.fieldnames)
+        if is_new:
+            writer.writeheader()
+            fh.flush()
+        return fh, writer
+
+    def write_rows(self, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+
+        if self._all_writer is None:
+            fh, wr = self._open_writer(self.all_path)
+            self._all_fh, self._all_writer = fh, wr
+
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in fieldnames})
+            # write to ALL
+            self._all_writer.writerow(r)
+
+            # write to month partition
+            mk = r.get("period_key") or "unknown"
+            if mk not in self._month_writers:
+                path = self.monthly_dir / f"prozorro_dairy_items_{mk}.csv"
+                fh, wr = self._open_writer(path)
+                self._month_fhs[mk] = fh
+                self._month_writers[mk] = wr
+            self._month_writers[mk].writerow(r)
+
+        self.flush()
+
+    def flush(self) -> None:
+        if self._all_fh:
+            self._all_fh.flush()
+        for fh in self._month_fhs.values():
+            fh.flush()
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        finally:
+            if self._all_fh:
+                self._all_fh.close()
+            for fh in self._month_fhs.values():
+                fh.close()
 
 
-def write_xlsx_chunk(path: Path, fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
-    if Workbook is None:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "data"
-    ws.append(fieldnames)
-    for r in rows:
-        ws.append([r.get(k, "") for k in fieldnames])
-    wb.save(path.as_posix())
+def parse_start_offset(logger: logging.Logger) -> str:
+    if START_OFFSET:
+        return START_OFFSET
+
+    # Start from START_DATE at 00:00 UTC -> feed offset accepts date-time / timestamp-like offsets in practice.
+    # We use ISO string (safe) rather than float to avoid formatting issues.
+    dt = datetime.fromisoformat(START_DATE).replace(tzinfo=timezone.utc)
+    # Some feeds accept ISO offset as well; if your API expects numeric, replace with dt.timestamp().
+    return dt.isoformat()
 
 
-def safe_get(d: Dict[str, Any], path: List[str], default=None):
-    cur = d
-    for p in path:
-        if not isinstance(cur, dict) or p not in cur:
-            return default
-        cur = cur[p]
-    return cur
+def request_json(
+    session: requests.Session,
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 30,
+    max_retries: int = 8,
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, Any]:
+    backoff = 1.0
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = session.get(url, params=params, timeout=timeout)
+            if resp.status_code == 429:
+                ra = resp.headers.get("Retry-After")
+                sleep_s = float(ra) if ra and ra.isdigit() else backoff
+                if logger:
+                    logger.warning("429 Too Many Requests. Sleep %.1fs (attempt %d/%d)", sleep_s, attempt, max_retries)
+                time.sleep(sleep_s)
+                backoff = min(backoff * 2, 60)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            if logger:
+                logger.warning("Request failed: %s | attempt %d/%d | sleep %.1fs", str(e), attempt, max_retries, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+    raise RuntimeError("Unreachable")
 
 
-def fetch_tenders_page(session: requests.Session, offset: Optional[str], logger: logging.Logger) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    params = {"limit": LIMIT}
-    if offset:
-        params["offset"] = offset
-    url = f"{BASE_URL}/tenders"
-    r = session.get(url, params=params, timeout=60)
-    if r.status_code != 200:
-        logger.warning("Feed request failed: %s %s", r.status_code, r.text[:200])
-        return [], offset
-    j = r.json()
-    data = j.get("data") or []
-    next_offset = safe_get(j, ["next_page", "offset"], None)
-    return data, next_offset
+def cpv_matches(cpv_id: str) -> bool:
+    d = digits_only(cpv_id)
+    base = d[:8] if len(d) >= 8 else d
+    for pref in ALLOWED_PREFIXES:
+        if base.startswith(pref):
+            return True
+    return False
 
 
-def fetch_tender_detail(session: requests.Session, tender_id: str, logger: logging.Logger) -> Optional[Dict[str, Any]]:
-    # opt_fields may be ignored by server; safe either way
-    params = {
-        "opt_fields": ",".join(
-            [
-                "tenderID",
-                "datePublished",
-                "dateModified",
-                "status",
-                "title",
-                "procuringEntity",
-                "value",
-                "auctionPeriod",
-                "items",
-                "lots",
-            ]
-        )
-    }
-    url = f"{BASE_URL}/tenders/{tender_id}"
-    r = session.get(url, params=params, timeout=90)
-    if r.status_code != 200:
-        logger.debug("Detail failed %s: %s", tender_id, r.status_code)
-        return None
-    j = r.json()
-    return j.get("data")
+def extract_rows(tender: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
 
+    t_id = tender.get("id", "")
+    tenderID = tender.get("tenderID", "")
+    dateModified = tender.get("dateModified", "")
+    status = tender.get("status", "")
+    title = tender.get("title", "")
+    pmt = tender.get("procurementMethodType", "")
 
-def parse_tender(detail: Dict[str, Any], run_ts: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    tender_id = detail.get("id", "")
-    tenderID = detail.get("tenderID", "")
-    status = detail.get("status", "")
-    datePublished = detail.get("datePublished", "")
-    dateModified = detail.get("dateModified", "")
-    title = detail.get("title", "")
-
-    pe = detail.get("procuringEntity") or {}
+    pe = tender.get("procuringEntity") or {}
     pe_name = pe.get("name", "")
-    pe_edrpou = safe_get(pe, ["identifier", "id"], "")
+    pe_ident = pe.get("identifier") or {}
+    pe_edrpou = pe_ident.get("id", "")
 
-    value_amount = safe_get(detail, ["value", "amount"], "")
-    value_currency = safe_get(detail, ["value", "currency"], "")
+    tenderPeriod = tender.get("tenderPeriod") or {}
+    tp_start = tenderPeriod.get("startDate", "")
+    tp_end = tenderPeriod.get("endDate", "")
 
-    auction_start = safe_get(detail, ["auctionPeriod", "startDate"], "")
-    auction_end = safe_get(detail, ["auctionPeriod", "endDate"], "")
+    auctionPeriod = tender.get("auctionPeriod") or {}
+    auc_start = auctionPeriod.get("startDate", "")
 
-    tender_row = {
-        "run_ts_utc": run_ts,
-        "tender_id": tender_id,
-        "tenderID": tenderID,
-        "tender_status": status,
-        "tender_datePublished": datePublished,
-        "tender_dateModified": dateModified,
-        "title": title,
-        "procuringEntity_name": pe_name,
-        "procuringEntity_edrpou": pe_edrpou,
-        "value_amount": value_amount,
-        "value_currency": value_currency,
-        "auction_startDate": auction_start,
-        "auction_endDate": auction_end,
-    }
+    value = tender.get("value") or {}
+    t_val_amount = value.get("amount", "")
+    t_val_curr = value.get("currency", "")
 
-    items = detail.get("items") or []
-    out_items: List[Dict[str, Any]] = []
+    # awards (best effort)
+    award_status = ""
+    award_date = ""
+    award_value_amount = ""
+    award_value_currency = ""
+    supplier_name = ""
+    supplier_id = ""
+    awards = tender.get("awards") or []
+    if isinstance(awards, list) and awards:
+        # choose "active" first, else first
+        aw = next((a for a in awards if a.get("status") == "active"), awards[0])
+        award_status = aw.get("status", "")
+        award_date = aw.get("date", "") or aw.get("dateModified", "")
+        aw_val = aw.get("value") or {}
+        award_value_amount = aw_val.get("amount", "")
+        award_value_currency = aw_val.get("currency", "")
+        suppliers = aw.get("suppliers") or []
+        if suppliers:
+            s0 = suppliers[0]
+            supplier_name = s0.get("name", "")
+            sid = (s0.get("identifier") or {}).get("id", "")
+            supplier_id = sid
+
+    items = tender.get("items") or []
+    if not isinstance(items, list) or not items:
+        return rows
 
     for it in items:
         cls = it.get("classification") or {}
-        if (cls.get("scheme") or "").upper() != "CPV":
+        cpv_id = cls.get("id", "")
+        cpv_desc = cls.get("description", "")
+
+        # also check additionalClassifications if main is not CPV-like
+        ok = False
+        if cpv_id and cpv_matches(cpv_id):
+            ok = True
+        else:
+            add_cls = it.get("additionalClassifications") or []
+            if isinstance(add_cls, list):
+                for ac in add_cls:
+                    acid = (ac or {}).get("id", "")
+                    if acid and cpv_matches(acid):
+                        ok = True
+                        cpv_id = acid
+                        cpv_desc = (ac or {}).get("description", "")
+                        break
+
+        if not ok:
             continue
 
-        cpv = cls.get("id", "")  # "15511000-3"
-        cpv_digits = digits_only_cpv(cpv)
-        if not matches_allowed_cpv(cpv_digits):
-            continue
+        item_id = it.get("id", "")
+        item_desc = it.get("description", "")
+        qty = it.get("quantity", "")
+        unit = (it.get("unit") or {}).get("name", "")
 
-        unit = it.get("unit") or {}
-        unit_value = unit.get("value") or {}
-        delivery = it.get("deliveryAddress") or {}
-        delivery_end = safe_get(it, ["deliveryDate", "endDate"], "")
+        delivery = it.get("deliveryDate") or {}
+        delivery_end = delivery.get("endDate", "") or delivery.get("startDate", "")
 
-        out_items.append(
-            {
-                "run_ts_utc": run_ts,
-                "tender_id": tender_id,
-                "tenderID": tenderID,
-                "tender_status": status,
-                "tender_datePublished": datePublished,
-                "tender_dateModified": dateModified,
-                "procuringEntity_name": pe_name,
-                "procuringEntity_edrpou": pe_edrpou,
-                "auction_startDate": auction_start,
-                "auction_endDate": auction_end,
-                "item_id": it.get("id", ""),
-                "item_description": it.get("description", ""),
-                "cpv": cpv,
-                "cpv_digits": cpv_digits,
-                "quantity": it.get("quantity", ""),
-                "unit_name": unit.get("name", ""),
-                "unit_code": unit.get("code", ""),
-                "unit_value_amount": unit_value.get("amount", ""),
-                "unit_value_currency": unit_value.get("currency", ""),
-                "delivery_endDate": delivery_end,
-                "delivery_streetAddress": delivery.get("streetAddress", ""),
-                "delivery_locality": delivery.get("locality", ""),
-                "delivery_region": delivery.get("region", ""),
-                "delivery_postalCode": delivery.get("postalCode", ""),
-                "delivery_countryName": delivery.get("countryName", ""),
-            }
-        )
+        addr = it.get("deliveryAddress") or {}
+        delivery_region = addr.get("region", "")
+        delivery_locality = addr.get("locality", "")
 
-    return tender_row, out_items
+        # period key for partitioning: prioritize auction date, else dateModified
+        period_key = iso_to_month_key(auc_start or dateModified or tp_start)
+
+        rows.append({
+            "tender_id": t_id,
+            "tenderID": tenderID,
+            "dateModified": dateModified,
+            "status": status,
+            "title": title,
+            "procurementMethodType": pmt,
+            "procuringEntity_name": pe_name,
+            "procuringEntity_edrpou": pe_edrpou,
+            "tenderPeriod_startDate": tp_start,
+            "tenderPeriod_endDate": tp_end,
+            "auctionPeriod_startDate": auc_start,
+            "tender_value_amount": t_val_amount,
+            "tender_value_currency": t_val_curr,
+            "item_id": item_id,
+            "item_description": item_desc,
+            "cpv_id": cpv_id,
+            "cpv_description": cpv_desc,
+            "item_quantity": qty,
+            "item_unit": unit,
+            "delivery_endDate": delivery_end,
+            "delivery_region": delivery_region,
+            "delivery_locality": delivery_locality,
+            "award_status": award_status,
+            "award_date": award_date,
+            "award_value_amount": award_value_amount,
+            "award_value_currency": award_value_currency,
+            "supplier_name": supplier_name,
+            "supplier_id": supplier_id,
+            "period_key": period_key,
+        })
+
+    return rows
 
 
-def main() -> int:
+def fetch_tender_detail(session: requests.Session, tender_id: str, logger: logging.Logger) -> Tuple[str, Optional[List[Dict[str, Any]]], Optional[str]]:
+    url = f"{BASE_URL}/tenders/{tender_id}"
+    # opt_fields helps reduce payload; supported by API :contentReference[oaicite:8]{index=8}
+    params = {
+        "opt_fields": ",".join([
+            "id", "tenderID", "dateModified", "status", "title", "procurementMethodType",
+            "procuringEntity", "tenderPeriod", "auctionPeriod", "value",
+            "items", "awards"
+        ])
+    }
+    try:
+        data = request_json(session, url, params=params, logger=logger)
+        tender = data.get("data") or {}
+        rows = extract_rows(tender)
+        return tender_id, rows, None
+    except Exception as e:
+        return tender_id, None, str(e)
+
+
+def main() -> None:
+    mkdirs()
     logger = setup_logger()
-    session = build_session()
 
-    cp = read_checkpoint()
-    offset = cp.get("offset")
+    logger.info("Log file: %s", str(LOG_PATH))
+    logger.info("BASE_URL=%s", BASE_URL)
+    logger.info("ALLOWED_PREFIXES=%s", ALLOWED_PREFIXES)
+    logger.info("LIMIT=%s | DETAIL_WORKERS=%s | MAX_RUNTIME_MINUTES=%s | SAVE_EVERY_SECONDS=%s",
+                LIMIT, DETAIL_WORKERS, MAX_RUNTIME_MINUTES, SAVE_EVERY_SECONDS)
+
+    checkpoint = load_checkpoint()
+    offset = checkpoint.get("offset") or parse_start_offset(logger)
+    stats = Stats(last_offset=str(offset))
+
     logger.info("Start offset=%s", offset)
 
-    run_ts = utc_now_iso()
-    run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    run_dir = RUNS_DIR / f"run_{run_id}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    session = requests.Session()
+    session.headers.update({"User-Agent": f"prozzoro-dairy-fetch/{RUN_ID}"})
 
-    # Buffers
-    tender_buf: List[Dict[str, Any]] = []
-    item_buf: List[Dict[str, Any]] = []
+    writer = CsvPartitionWriter(ALL_CSV_PATH, MONTHLY_DIR, FIELDNAMES)
 
-    # For periodic XLSX chunks (only delta rows)
-    xlsx_pending_tenders: List[Dict[str, Any]] = []
-    xlsx_pending_items: List[Dict[str, Any]] = []
+    start_mon = time.monotonic()
+    deadline = start_mon + MAX_RUNTIME_MINUTES * 60
+    last_save = start_mon
 
-    stats = {
-        "pages": 0,
-        "tenders_seen": 0,
-        "details_ok": 0,
-        "details_failed": 0,
-        "dairy_tenders": 0,
-        "dairy_items": 0,
-        "last_offset": offset,
-    }
-
-    start = time.monotonic()
-    # reserve ~90 sec for final flush so we do NOT get cancelled while uploading artifacts
-    deadline = start + max(60, MAX_RUNTIME_MINUTES * 60 - 90)
-
-    next_flush = start + FLUSH_EVERY_SECONDS
-    next_xlsx = start + XLSX_CHUNK_EVERY_SECONDS
-
-    def flush(force: bool = False):
-        nonlocal tender_buf, item_buf, xlsx_pending_tenders, xlsx_pending_items
-
-        if not force and not tender_buf and not item_buf:
-            return
-
-        # write cumulative csv
-        if tender_buf:
-            append_csv(TENDERS_CSV, TENDER_FIELDS, tender_buf)
-            append_csv(run_dir / "dairy_tenders.csv", TENDER_FIELDS, tender_buf)
-            xlsx_pending_tenders.extend(tender_buf)
-            tender_buf = []
-
-        if item_buf:
-            append_csv(ITEMS_CSV, ITEM_FIELDS, item_buf)
-            append_csv(run_dir / "dairy_items.csv", ITEM_FIELDS, item_buf)
-            xlsx_pending_items.extend(item_buf)
-            item_buf = []
-
-        # update checkpoint frequently
-        stats["last_offset"] = offset
-        write_checkpoint(offset, stats)
-
-    def write_xlsx_chunks():
-        nonlocal xlsx_pending_tenders, xlsx_pending_items
-
-        if Workbook is None:
-            return
-
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        if xlsx_pending_tenders:
-            write_xlsx_chunk(XLSX_CHUNKS_DIR / f"dairy_tenders_chunk_{ts}.xlsx", TENDER_FIELDS, xlsx_pending_tenders)
-            write_xlsx_chunk(run_dir / f"dairy_tenders_chunk_{ts}.xlsx", TENDER_FIELDS, xlsx_pending_tenders)
-            xlsx_pending_tenders = []
-
-        if xlsx_pending_items:
-            write_xlsx_chunk(XLSX_CHUNKS_DIR / f"dairy_items_chunk_{ts}.xlsx", ITEM_FIELDS, xlsx_pending_items)
-            write_xlsx_chunk(run_dir / f"dairy_items_chunk_{ts}.xlsx", ITEM_FIELDS, xlsx_pending_items)
-            xlsx_pending_items = []
-
-    while True:
-        now = time.monotonic()
-        if STOP_REQUESTED:
-            logger.warning("Stop requested by signal; finishing gracefully...")
-            break
-        if now >= deadline:
-            logger.info("Time budget reached; finishing gracefully to allow artifact upload.")
-            break
-        if stats["pages"] >= MAX_PAGES_PER_RUN:
-            logger.info("MAX_PAGES_PER_RUN reached; finishing gracefully.")
-            break
-
-        # periodic flush/save
-        if now >= next_flush:
-            flush(force=False)
-            next_flush = now + FLUSH_EVERY_SECONDS
-
-        if now >= next_xlsx:
-            flush(force=False)
-            write_xlsx_chunks()
-            next_xlsx = now + XLSX_CHUNK_EVERY_SECONDS
-
-        # fetch feed page
-        page, next_offset = fetch_tenders_page(session, offset, logger)
-        stats["pages"] += 1
-
-        if not page:
-            logger.info("Feed returned empty page; stop.")
-            offset = next_offset
-            stats["last_offset"] = offset
-            break
-
-        stats["tenders_seen"] += len(page)
-
-        # process details sequentially (safe). If you want faster: set DETAIL_WORKERS>1 and implement pool.
-        dairy_found_in_page = 0
-
-        for t in page:
-            if STOP_REQUESTED or time.monotonic() >= deadline:
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= deadline - 90:  # leave a bit of time buffer
+                logger.warning("Time budget reached. Stopping gracefully to allow upload/commit steps.")
                 break
 
-            tid = t.get("id")
-            if not tid:
-                continue
+            feed_url = f"{BASE_URL}/tenders"
+            params = {"offset": offset, "limit": LIMIT}
+            feed = request_json(session, feed_url, params=params, logger=logger)
 
-            detail = fetch_tender_detail(session, tid, logger)
-            if not detail:
-                stats["details_failed"] += 1
-                continue
+            tenders = feed.get("data") or []
+            next_page = feed.get("next_page") or {}
+            next_offset = next_page.get("offset") or ""
 
-            stats["details_ok"] += 1
-            tender_row, dairy_items = parse_tender(detail, run_ts)
-            if dairy_items:
-                dairy_found_in_page += 1
-                stats["dairy_tenders"] += 1
-                stats["dairy_items"] += len(dairy_items)
-                tender_buf.append(tender_row)
-                item_buf.extend(dairy_items)
+            if not tenders:
+                logger.info("No tenders returned. offset=%s. Done.", offset)
+                break
 
-        offset = next_offset
-        stats["last_offset"] = offset
+            stats.pages += 1
+            stats.tenders_in_feed += len(tenders)
 
-        logger.info(
-            "Progress | pages=%s | tenders_seen=%s | details_ok=%s | dairy_tenders=%s | dairy_items=%s | offset=%s",
-            stats["pages"],
-            stats["tenders_seen"],
-            stats["details_ok"],
-            stats["dairy_tenders"],
-            stats["dairy_items"],
-            str(offset)[:80],
-        )
+            ids = [t.get("id") for t in tenders if t.get("id")]
+            logger.info("Progress | pages=%d | batch=%d | offset=%s", stats.pages, len(ids), offset)
 
-    # final flush + xlsx chunks
-    flush(force=True)
-    write_xlsx_chunks()
-    write_checkpoint(offset, stats)
+            batch_rows: List[Dict[str, Any]] = []
+            with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as ex:
+                futs = [ex.submit(fetch_tender_detail, session, tid, logger) for tid in ids]
+                for fut in as_completed(futs):
+                    tid, rows, err = fut.result()
+                    if err:
+                        stats.tenders_details_fail += 1
+                        logger.warning("Detail fail tender_id=%s err=%s", tid, err)
+                        continue
+                    stats.tenders_details_ok += 1
+                    if rows:
+                        batch_rows.extend(rows)
 
-    logger.info("Done. Stats=%s", stats)
-    # IMPORTANT: exit 0 so that the workflow continues to upload artifacts/commit checkpoint
-    return 0
+            if batch_rows:
+                writer.write_rows(batch_rows)
+                stats.matched_rows += len(batch_rows)
+
+            # Advance offset only after processing & writing this page
+            if not next_offset or str(next_offset) == str(offset):
+                logger.info("No next_offset or unchanged. Stopping. next_offset=%s", str(next_offset))
+                break
+
+            offset = str(next_offset)
+            stats.last_offset = offset
+
+            # periodic checkpoint + summary
+            now = time.monotonic()
+            if now - last_save >= SAVE_EVERY_SECONDS:
+                ck = {
+                    "offset": offset,
+                    "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "stats": {
+                        "pages": stats.pages,
+                        "tenders_in_feed": stats.tenders_in_feed,
+                        "tenders_details_ok": stats.tenders_details_ok,
+                        "tenders_details_fail": stats.tenders_details_fail,
+                        "matched_rows": stats.matched_rows,
+                    },
+                }
+                atomic_write_json(CHECKPOINT_PATH, ck)
+                logger.info("Checkpoint saved: %s", str(CHECKPOINT_PATH))
+                last_save = now
+
+        # final checkpoint
+        ck = {
+            "offset": offset,
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "stats": {
+                "pages": stats.pages,
+                "tenders_in_feed": stats.tenders_in_feed,
+                "tenders_details_ok": stats.tenders_details_ok,
+                "tenders_details_fail": stats.tenders_details_fail,
+                "matched_rows": stats.matched_rows,
+            },
+            "run_id": RUN_ID,
+        }
+        atomic_write_json(CHECKPOINT_PATH, ck)
+        logger.info("Final checkpoint saved: %s", str(CHECKPOINT_PATH))
+        logger.info("DONE | pages=%d | tenders_in_feed=%d | details_ok=%d | details_fail=%d | matched_rows=%d",
+                    stats.pages, stats.tenders_in_feed, stats.tenders_details_ok, stats.tenders_details_fail, stats.matched_rows)
+
+    finally:
+        writer.close()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
