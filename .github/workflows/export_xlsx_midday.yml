@@ -3,21 +3,19 @@ name: export-xlsx-midday
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 10 * * *"
+    - cron: "0 10 * * *"  # 12:00 Kyiv winter time (UTC+2). Adjust for DST if needed.
 
 permissions:
   contents: write
 
 jobs:
-  export:
+  export-xlsx:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,14 +27,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Build full XLSX
+      - name: Export XLSX
         run: |
-          python -u src/export_current_to_xlsx.py
+          python src/export_xlsx_midday.py
 
       - name: Upload XLSX
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prozorro-dairy-full-xlsx
+          name: prozorro-dairy-xlsx-${{ github.run_id }}
           path: |
-            data/outputs/current/dairy_full_export.xlsx
+            data/outputs/*.xlsx
 
+      - name: Commit XLSX to repo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/outputs/*.xlsx || true
+          git commit -m "Update XLSX export [skip ci]" || echo "No changes to commit"
+          git push || true
