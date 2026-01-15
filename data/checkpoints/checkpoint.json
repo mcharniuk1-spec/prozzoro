@@ -1,13 +1,13 @@
 {
-  "next_offset": "1492792901.920177.1.b283d31fe815c2f42116da50460d97fd",
-  "updated_at": "2026-01-15T18:02:01Z",
+  "next_offset": "1493218179.637259.1.7c6d74cd9aeaa2d86df2a3ce768f10c7",
+  "updated_at": "2026-01-15T19:07:18Z",
   "stats": {
-    "pages": 104,
-    "tenders_scanned": 10400,
-    "details_fetched": 10400,
-    "dairy_tenders": 213,
-    "dairy_items": 257,
-    "started_at": "2026-01-15T17:32:59Z",
+    "pages": 120,
+    "tenders_scanned": 12000,
+    "details_fetched": 12000,
+    "dairy_tenders": 289,
+    "dairy_items": 370,
+    "started_at": "2026-01-15T18:38:07Z",
     "base_url": "https://public-api.prozorro.gov.ua/api/2.5",
     "limit": 100
   }
