@@ -1,0 +1,12 @@
+{
+  "offset": "1712655763.702.1.e904d4616f2034169b1b783308f4b73e",
+  "updated_at_utc": "2026-01-19T06:12:38.696258+00:00",
+  "stats": {
+    "pages": 9459,
+    "tenders_in_feed": 945906,
+    "tenders_details_ok": 945906,
+    "tenders_details_fail": 0,
+    "matched_rows": 37512
+  },
+  "run_id": "20260119_005408_utc"
+}
