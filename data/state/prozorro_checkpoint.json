@@ -1,12 +1,12 @@
 {
-  "offset": "1771850321.447.1.9eab18b149eb35ad024350388bbc11d2",
-  "updated_at_utc": "2026-02-23T12:38:42.023380+00:00",
+  "offset": "1771872475.75.1.b4b01ebc20b63740f12f2f563bdaf8d9",
+  "updated_at_utc": "2026-02-23T18:48:04.252658+00:00",
   "stats": {
-    "pages": 146,
-    "tenders_in_feed": 14178,
-    "tenders_details_ok": 14178,
+    "pages": 91,
+    "tenders_in_feed": 9063,
+    "tenders_details_ok": 9063,
     "tenders_details_fail": 0,
-    "matched_rows": 400
+    "matched_rows": 289
   },
-  "run_id": "20260223_123415_utc"
+  "run_id": "20260223_184500_utc"
 }
